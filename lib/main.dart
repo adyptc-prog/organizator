@@ -1,0 +1,3403 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io' show Platform;
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+// ─── Constante ───────────────────────────────────────────────────────────────
+const _kBoardsKey      = 'management_boards';
+const _kActiveBoardKey = 'management_active_board';
+const _kSmsTemplateKey = 'sms_template';
+
+// Chei folosite înainte de suportul pentru mai multe tabele — păstrate doar
+// pentru migrarea automată a datelor existente în „Tabel 1”.
+const _kLegacyItemsKey         = 'management_items';
+const _kLegacyNextNumberKey    = 'management_next_number';
+const _kLegacyDeletedBufferKey = 'management_deleted_buffer';
+const _kLegacySyncPartnerKey   = 'sync_partner_phone';
+
+String _itemsKeyFor(String boardId)         => 'management_items_$boardId';
+String _nextNumberKeyFor(String boardId)    => 'management_next_number_$boardId';
+String _deletedBufferKeyFor(String boardId) => 'management_deleted_buffer_$boardId';
+String _syncPartnerKeyFor(String boardId)   => 'sync_partner_phone_$boardId';
+
+// ── Chei pentru setările de rezervări prin SMS (per tabel) ────────────────────
+String _bookingEnabledKeyFor(String boardId)      => 'booking_enabled_$boardId';
+String _appointmentDurationKeyFor(String boardId) => 'appointment_duration_$boardId';
+String _workStartKeyFor(String boardId)           => 'work_start_$boardId';
+String _workEndKeyFor(String boardId)             => 'work_end_$boardId';
+String _closedDaysKeyFor(String boardId)          => 'closed_days_$boardId';
+
+const _kDefaultSmsTemplate =
+    'Alertă: [NUME]. Va expira la [DATA_EXPIRARE]. Te rugăm să iei măsurile necesare.';
+
+// ─── Helper: ID unic stabil pentru sincronizare ───────────────────────────────
+String _generateSyncId() {
+  final r = Random.secure();
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  return List.generate(16, (_) => chars[r.nextInt(chars.length)]).join();
+}
+
+// Format ISO scurt (fără secunde) pentru SMS compact
+String _isoShort(DateTime dt) =>
+    '${dt.year}-'
+    '${dt.month.toString().padLeft(2, '0')}-'
+    '${dt.day.toString().padLeft(2, '0')}T'
+    '${dt.hour.toString().padLeft(2, '0')}:'
+    '${dt.minute.toString().padLeft(2, '0')}';
+
+// ─── Serviciu notificări push ─────────────────────────────────────────────────
+// Notificările sunt programate via AlarmManager nativ (același mecanism ca SMS),
+// prin NotifAlarmReceiver.kt — fiabil pe orice versiune Android, fără dependență
+// de flutter_local_notifications scheduling.
+class NotificationService {
+  static const _ch = MethodChannel('organizator/sms');
+
+  static final _plugin = FlutterLocalNotificationsPlugin();
+
+  static Future<void> init() async {
+    // Inițializăm plugin-ul doar pentru requestPermissions — fără scheduling
+    const settings = InitializationSettings(
+      android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      iOS: DarwinInitializationSettings(),
+    );
+    await _plugin.initialize(settings);
+  }
+
+  static Future<void> requestPermissions() async {
+    try {
+      final android = _plugin.resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin>();
+      await android?.requestNotificationsPermission();
+      await android?.requestExactAlarmsPermission();
+      await _plugin
+          .resolvePlatformSpecificImplementation<
+              IOSFlutterLocalNotificationsPlugin>()
+          ?.requestPermissions(alert: true, badge: true, sound: true);
+    } catch (_) {}
+
+    if (Platform.isAndroid) {
+      try {
+        final status = await Permission.ignoreBatteryOptimizations.status;
+        if (!status.isGranted) {
+          await Permission.ignoreBatteryOptimizations.request();
+        }
+      } catch (_) {}
+    }
+  }
+
+  // ID-urile alarmelor includ indexul tabelului (0, 1, 2) ca să nu se
+  // suprapună între tabele diferite — pentru tabelul 0 (primul, migrat din
+  // versiunea cu un singur tabel) formula rămâne identică cu cea veche.
+  static Future<void> scheduleFor(Item item, {required int boardIndex}) async {
+    if (!Platform.isAndroid) return;
+    await cancelFor(item.number, boardIndex: boardIndex);
+    final now  = DateTime.now();
+    final base = boardIndex * 1000000;
+
+    if (item.warningAt != null &&
+        item.warningAt!.isAfter(now) &&
+        item.expiresAt != null) {
+      await _schedule(
+        id: base + item.number * 10 + 1,
+        when: item.warningAt!,
+        title: '⚠️ Alertă: ${item.name}',
+        body: 'Va expira la ${_fmt(item.expiresAt!)}',
+      );
+    }
+    if (item.expiresAt != null && item.expiresAt!.isAfter(now)) {
+      await _schedule(
+        id: base + item.number * 10 + 2,
+        when: item.expiresAt!,
+        title: '🔴 Expirat: ${item.name}',
+        body: 'Înregistrarea a expirat la ${_fmt(item.expiresAt!)}',
+      );
+    }
+  }
+
+  static Future<void> cancelFor(int number, {required int boardIndex}) async {
+    if (!Platform.isAndroid) return;
+    final base = boardIndex * 1000000;
+    try {
+      await _ch.invokeMethod<void>('cancelNotif', {'id': base + number * 10 + 1});
+      await _ch.invokeMethod<void>('cancelNotif', {'id': base + number * 10 + 2});
+    } catch (_) {}
+  }
+
+  static Future<void> _schedule({
+    required int id,
+    required DateTime when,
+    required String title,
+    required String body,
+  }) async {
+    try {
+      await _ch.invokeMethod<void>('scheduleNotif', {
+        'id': id,
+        'triggerAtMs': when.millisecondsSinceEpoch,
+        'title': title,
+        'body': body,
+      });
+    } catch (_) {}
+  }
+
+  static String _fmt(DateTime dt) =>
+      '${dt.day.toString().padLeft(2, '0')}.'
+      '${dt.month.toString().padLeft(2, '0')}.'
+      '${dt.year} '
+      '${dt.hour.toString().padLeft(2, '0')}:'
+      '${dt.minute.toString().padLeft(2, '0')}';
+}
+
+// ─── Serviciu SMS (alarme programate via Kotlin AlarmManager) ─────────────────
+class SmsService {
+  static const _ch = MethodChannel('organizator/sms');
+
+  static Future<void> requestPermission() async {
+    try { await Permission.sms.request(); } catch (_) {}
+    // Solicită RECEIVE_SMS nativ pentru funcția de sincronizare
+    if (Platform.isAndroid) {
+      try { await _ch.invokeMethod<void>('requestReceiveSms'); } catch (_) {}
+    }
+  }
+
+  // ID-urile includ indexul tabelului (0, 1, 2) ca să nu se suprapună între
+  // tabele diferite — pentru tabelul 0 formula rămâne identică cu cea veche.
+  static List<int> _warnIds(int n, int boardIndex) {
+    final base = boardIndex * 10000000;
+    return [base + n * 100 + 10, base + n * 100 + 11, base + n * 100 + 12];
+  }
+
+  static List<int> _expIds(int n, int boardIndex) {
+    final base = boardIndex * 10000000;
+    return [base + n * 100 + 20, base + n * 100 + 21, base + n * 100 + 22];
+  }
+
+  static Future<void> scheduleFor(Item item,
+      {String template = _kDefaultSmsTemplate, required int boardIndex}) async {
+    cancelFor(item.number, boardIndex: boardIndex);
+    final phones = item.phones;
+    if (phones.isEmpty) return;
+
+    final now       = DateTime.now();
+    final expiryStr = item.expiresAt != null ? _fmt(item.expiresAt!) : 'nesetată';
+    String buildMsg(String tmpl) => tmpl
+        .replaceAll('[NUME]', item.name)
+        .replaceAll('[DATA_EXPIRARE]', expiryStr);
+
+    if (item.warningAt != null && item.warningAt!.isAfter(now)) {
+      final ids = _warnIds(item.number, boardIndex);
+      for (var i = 0; i < phones.length && i < ids.length; i++) {
+        await _schedule(
+            id: ids[i], when: item.warningAt!, phone: phones[i],
+            message: buildMsg(template));
+      }
+    }
+    if (item.expiresAt != null && item.expiresAt!.isAfter(now)) {
+      final ids = _expIds(item.number, boardIndex);
+      for (var i = 0; i < phones.length && i < ids.length; i++) {
+        await _schedule(
+            id: ids[i], when: item.expiresAt!, phone: phones[i],
+            message: 'EXPIRAT: ${buildMsg(template)}');
+      }
+    }
+  }
+
+  static void cancelFor(int number, {required int boardIndex}) {
+    final base = boardIndex * 10000000;
+    final ids = [
+      ..._warnIds(number, boardIndex), ..._expIds(number, boardIndex),
+      base + number * 10 + 3, base + number * 10 + 4,
+    ];
+    for (final id in ids) {
+      _ch.invokeMethod<void>('cancel', {'id': id}).ignore();
+      SharedPreferences.getInstance()
+          .then((p) => p.remove('sms_alarm_$id'))
+          .ignore();
+    }
+  }
+
+  static Future<void> _schedule({
+    required int id,
+    required DateTime when,
+    required String phone,
+    required String message,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          'sms_alarm_$id', jsonEncode({'phone': phone, 'message': message}));
+      await _ch.invokeMethod('schedule', {
+        'id': id,
+        'triggerAtMs': when.millisecondsSinceEpoch,
+      });
+    } catch (_) {}
+  }
+
+  static String _fmt(DateTime dt) =>
+      '${dt.day.toString().padLeft(2, '0')}.'
+      '${dt.month.toString().padLeft(2, '0')}.'
+      '${dt.year} '
+      '${dt.hour.toString().padLeft(2, '0')}:'
+      '${dt.minute.toString().padLeft(2, '0')}';
+
+  // Calculul sloturilor libere rulează nativ (Kotlin) pe Android — aceeași
+  // sursă de adevăr folosită și de botul de rezervări prin SMS, ca ecranul
+  // „Spatiere” să nu poată diverge de ce vede botul. Nu e disponibil pe alte
+  // platforme (nu există acces SMS acolo, deci nici bot de rezervat).
+  static Future<List<_FreeSlot>> _computeFreeSlots(
+    String boardId, {
+    int horizonDays = 14,
+    int maxResults = 200,
+  }) async {
+    if (!Platform.isAndroid) return [];
+    try {
+      final raw = await _ch.invokeMethod<String>('computeFreeSlots', {
+            'boardId': boardId,
+            'horizonDays': horizonDays,
+            'maxResults': maxResults,
+          }) ??
+          '[]';
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      return decoded.map((e) {
+        final m = e as Map<String, dynamic>;
+        return _FreeSlot(
+          DateTime.fromMillisecondsSinceEpoch(m['s'] as int),
+          DateTime.fromMillisecondsSinceEpoch(m['e'] as int),
+        );
+      }).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+}
+
+// ─── Serviciu sincronizare bidirecțională prin SMS ────────────────────────────
+//
+// Protocol:
+//   ORG:A:{json}  — item adăugat
+//   ORG:U:{json}  — item actualizat
+//   ORG:D:{syncId} — item șters
+//   ORG:I:{json}  — item din sincronizare inițială (bulk)
+//   ORG:Z:        — sfârșitul sincronizării inițiale
+//
+// Câmpuri JSON compact: s=syncId, n=name, d=description, c=createdAt,
+//   e=expiresAt, w=warningAt, p1/p2/p3=phoneNumbers
+class SyncService {
+  static const _ch = MethodChannel('organizator/sms');
+  static String? _partnerPhone;
+  static String  _boardId = '';
+
+  static bool get isSupported => Platform.isAndroid;
+  static bool get isActive =>
+      _partnerPhone != null && _partnerPhone!.isNotEmpty;
+  static String? get partnerPhone => _partnerPhone;
+
+  // Fiecare tabel are propriul partener de sincronizare — se încarcă la
+  // activarea tabelului respectiv.
+  static Future<void> load(String boardId) async {
+    _boardId = boardId;
+    _partnerPhone = null;
+    if (!isSupported) return;
+    final prefs = await SharedPreferences.getInstance();
+    _partnerPhone = prefs.getString(_syncPartnerKeyFor(boardId));
+  }
+
+  static Future<void> setPartner(String phone) async {
+    _partnerPhone = phone.trim();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_syncPartnerKeyFor(_boardId), _partnerPhone!);
+  }
+
+  static Future<void> clearPartner() async {
+    _partnerPhone = null;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_syncPartnerKeyFor(_boardId));
+  }
+
+  static Future<void> _send(String msg) async {
+    if (!isActive || !isSupported) return;
+    try {
+      await _ch.invokeMethod<void>('sendSms', {
+        'phone': _partnerPhone,
+        'message': msg,
+      });
+    } catch (_) {}
+  }
+
+  // Trimite toate înregistrările la sincronizarea inițială
+  static Future<void> sendInitialSync(List<Item> items) async {
+    for (final item in items) {
+      await _send('ORG:I:${jsonEncode(item.toSyncJson())}');
+      // Pauză între SMS-uri pentru a evita limitele operatorului
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+    }
+    await _send('ORG:Z:');
+  }
+
+  static Future<void> sendAdd(Item item) =>
+      _send('ORG:A:${jsonEncode(item.toSyncJson())}');
+
+  static Future<void> sendUpdate(Item item) =>
+      _send('ORG:U:${jsonEncode(item.toSyncJson())}');
+
+  static Future<void> sendDelete(String syncId) =>
+      _send('ORG:D:$syncId');
+
+  // Fiecare mesaj din coadă e etichetat de partea nativă cu tabelul al cărui
+  // partener configurat corespunde expeditorului SMS-ului (boardId poate fi
+  // gol dacă a fost primit înainte ca migrarea pe mai multe tabele să ruleze
+  // — în acel caz se consideră primul tabel).
+  static Future<List<SyncQueueEntry>> getPendingMessages() async {
+    if (!isSupported) return [];
+    try {
+      final raw = await _ch.invokeMethod<String>('getSyncMessages') ?? '[]';
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return [];
+      return decoded
+          .map<SyncQueueEntry?>((e) {
+            if (e is Map) {
+              final msg = e['msg'] as String?;
+              if (msg == null || msg.isEmpty) return null;
+              return (boardId: (e['board'] as String?) ?? '', msg: msg);
+            }
+            if (e is String && e.isNotEmpty) return (boardId: '', msg: e);
+            return null;
+          })
+          .whereType<SyncQueueEntry>()
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<void> clearQueue() async {
+    if (!isSupported) return;
+    try {
+      await _ch.invokeMethod<void>('clearSyncQueue');
+    } catch (_) {}
+  }
+}
+
+// ─── Serviciu licențiere ──────────────────────────────────────────────────────
+class LicenseService {
+  static const _ch              = MethodChannel('organizator/license');
+  static const _kTrialStartKey  = 'trial_start_date';
+  static const _trialDays       = 30;
+
+  static bool      _licensed   = false;
+  static DateTime? _trialStart;
+
+  // Fluxul nou: licență cu businessId + expirare, cumpărată de pe site
+  // (identic ca format cu Fidelio). Rulează alături de vechiul flux .orgtoken,
+  // fără să-l înlocuiască — orice cod vechi deja emis rămâne valabil.
+  static String  newLicenseStatus = 'missing';
+  static String  newLicenseMessage = '';
+  static String? newLicenseValidUntil;
+  static int?    newLicenseDaysUntilExpiry;
+  static bool    newLicenseIsLifetime = false;
+
+  static bool get isLicensed => _licensed;
+
+  static bool get isTrialActive {
+    if (_trialStart == null) return false;
+    return DateTime.now().isBefore(_trialStart!.add(const Duration(days: _trialDays)));
+  }
+
+  static int get trialDaysLeft {
+    if (_trialStart == null) return 0;
+    final expiry = _trialStart!.add(const Duration(days: _trialDays));
+    final left   = expiry.difference(DateTime.now()).inDays;
+    return left < 0 ? 0 : left;
+  }
+
+  // Non-Android: nelimitat
+  static bool get canAdd => !Platform.isAndroid || _licensed || isTrialActive;
+
+  static Future<void> load() async {
+    if (!Platform.isAndroid) { _licensed = true; return; }
+    try {
+      _licensed = await _ch.invokeMethod<bool>('isLicensed') ?? false;
+    } catch (_) {}
+    await checkNewLicense();
+    // Înregistrăm data primei instalări (trial start)
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_kTrialStartKey);
+    if (saved == null) {
+      _trialStart = DateTime.now();
+      await prefs.setString(_kTrialStartKey, _trialStart!.toIso8601String());
+    } else {
+      _trialStart = DateTime.tryParse(saved);
+    }
+  }
+
+  static Future<String?> getPendingToken() async {
+    if (!Platform.isAndroid) return null;
+    try {
+      return await _ch.invokeMethod<String?>('getPendingToken');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> checkNewLicense() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final r = await _ch.invokeMethod<Map<Object?, Object?>>('checkLicense');
+      newLicenseStatus = (r?['status'] as String?) ?? 'missing';
+      newLicenseMessage = (r?['message'] as String?) ?? '';
+      newLicenseValidUntil = r?['validUntil'] as String?;
+      newLicenseDaysUntilExpiry = r?['daysUntilExpiry'] as int?;
+      newLicenseIsLifetime = (r?['isLifetime'] as bool?) ?? false;
+      if (newLicenseStatus == 'active') {
+        _licensed = true;
+      }
+    } catch (_) {}
+  }
+
+  static Future<String> getBusinessId() async {
+    if (!Platform.isAndroid) return '';
+    try {
+      return await _ch.invokeMethod<String>('getBusinessId') ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  // Deschide selectorul nativ de fișiere, reverifică licența, și întoarce
+  // true dacă fișierul ales e o licență validă și activă.
+  static Future<bool> pickLicenseFile() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      await _ch.invokeMethod('pickLicenseFile');
+      await checkNewLicense();
+      return newLicenseStatus == 'active';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<({bool success, String message})> activate(String token) async {
+    if (!Platform.isAndroid) {
+      return (success: false, message: 'Nu este suportat pe această platformă.');
+    }
+    try {
+      final r = await _ch.invokeMethod<Map<Object?, Object?>>('verifyAndActivate',
+          {'token': token});
+      final success = (r?['success'] as bool?) ?? false;
+      final msg     = (r?['msg']     as String?) ?? '';
+      if (success) _licensed = true;
+      return (success: success, message: msg);
+    } catch (e) {
+      return (success: false, message: e.toString());
+    }
+  }
+}
+
+// ─── Model ────────────────────────────────────────────────────────────────────
+class Item {
+  final String syncId;
+  final int number;
+  final String name;
+  final String description;
+  final DateTime createdAt;
+  final DateTime? expiresAt;
+  final DateTime? warningAt;
+  final String? phoneNumber;
+  final String? phoneNumber2;
+  final String? phoneNumber3;
+
+  const Item({
+    required this.syncId,
+    required this.number,
+    required this.name,
+    required this.description,
+    required this.createdAt,
+    this.expiresAt,
+    this.warningAt,
+    this.phoneNumber,
+    this.phoneNumber2,
+    this.phoneNumber3,
+  });
+
+  List<String> get phones => [
+        if (phoneNumber  != null && phoneNumber!.isNotEmpty)  phoneNumber!,
+        if (phoneNumber2 != null && phoneNumber2!.isNotEmpty) phoneNumber2!,
+        if (phoneNumber3 != null && phoneNumber3!.isNotEmpty) phoneNumber3!,
+      ];
+
+  Item copyWith({
+    String? syncId,
+    int? number,
+    String? name,
+    String? description,
+    DateTime? createdAt,
+    DateTime? expiresAt,
+    bool clearExpiry = false,
+    DateTime? warningAt,
+    bool clearWarning = false,
+    String? phoneNumber,
+    bool clearPhone = false,
+    String? phoneNumber2,
+    bool clearPhone2 = false,
+    String? phoneNumber3,
+    bool clearPhone3 = false,
+  }) {
+    return Item(
+      syncId:       syncId       ?? this.syncId,
+      number:       number       ?? this.number,
+      name:         name         ?? this.name,
+      description:  description  ?? this.description,
+      createdAt:    createdAt    ?? this.createdAt,
+      expiresAt:    clearExpiry   ? null : (expiresAt   ?? this.expiresAt),
+      warningAt:    clearWarning  ? null : (warningAt   ?? this.warningAt),
+      phoneNumber:  clearPhone    ? null : (phoneNumber  ?? this.phoneNumber),
+      phoneNumber2: clearPhone2   ? null : (phoneNumber2 ?? this.phoneNumber2),
+      phoneNumber3: clearPhone3   ? null : (phoneNumber3 ?? this.phoneNumber3),
+    );
+  }
+
+  // Persistență locală (JSON complet)
+  Map<String, dynamic> toJson() => {
+        'syncId':       syncId,
+        'number':       number,
+        'name':         name,
+        'description':  description,
+        'createdAt':    createdAt.toIso8601String(),
+        'expiresAt':    expiresAt?.toIso8601String(),
+        'warningAt':    warningAt?.toIso8601String(),
+        'phoneNumber':  phoneNumber,
+        'phoneNumber2': phoneNumber2,
+        'phoneNumber3': phoneNumber3,
+      };
+
+  factory Item.fromJson(Map<String, dynamic> json) => Item(
+        // Migrare: dacă syncId lipsește (date vechi), generăm unul nou
+        syncId:       (json['syncId'] as String?) ?? _generateSyncId(),
+        number:       json['number']      as int,
+        name:         json['name']        as String,
+        description:  json['description'] as String,
+        createdAt:    DateTime.parse(json['createdAt'] as String),
+        expiresAt:    json['expiresAt']  != null
+            ? DateTime.parse(json['expiresAt']  as String) : null,
+        warningAt:    json['warningAt']  != null
+            ? DateTime.parse(json['warningAt']  as String) : null,
+        phoneNumber:  json['phoneNumber']  as String?,
+        phoneNumber2: json['phoneNumber2'] as String?,
+        phoneNumber3: json['phoneNumber3'] as String?,
+      );
+
+  // Format compact pentru SMS (câmpuri opționale omise dacă sunt goale/null)
+  Map<String, dynamic> toSyncJson() => {
+        's': syncId,
+        'n': name,
+        if (description.isNotEmpty) 'd': description,
+        'c': _isoShort(createdAt),
+        if (expiresAt != null) 'e': _isoShort(expiresAt!),
+        if (warningAt != null) 'w': _isoShort(warningAt!),
+        if (phoneNumber  != null && phoneNumber!.isNotEmpty)  'p1': phoneNumber,
+        if (phoneNumber2 != null && phoneNumber2!.isNotEmpty) 'p2': phoneNumber2,
+        if (phoneNumber3 != null && phoneNumber3!.isNotEmpty) 'p3': phoneNumber3,
+      };
+
+  factory Item.fromSyncJson(Map<String, dynamic> j) => Item(
+        syncId:       j['s'] as String,
+        number:       0, // numărul local se asignează la merge
+        name:         j['n'] as String,
+        description:  (j['d'] as String?) ?? '',
+        createdAt:    DateTime.parse(j['c'] as String),
+        expiresAt:    j['e'] != null ? DateTime.parse(j['e'] as String) : null,
+        warningAt:    j['w'] != null ? DateTime.parse(j['w'] as String) : null,
+        phoneNumber:  j['p1'] as String?,
+        phoneNumber2: j['p2'] as String?,
+        phoneNumber3: j['p3'] as String?,
+      );
+}
+
+// ─── Buffer înregistrări șterse (6 luni) ─────────────────────────────────────
+class DeletedItem {
+  final Item item;
+  final DateTime deletedAt;
+
+  const DeletedItem({required this.item, required this.deletedAt});
+
+  bool get isExpiredFromBuffer => deletedAt.isBefore(
+        DateTime.now().subtract(const Duration(days: 180)));
+
+  Map<String, dynamic> toJson() => {
+        'item': item.toJson(),
+        'deletedAt': deletedAt.toIso8601String(),
+      };
+
+  factory DeletedItem.fromJson(Map<String, dynamic> json) => DeletedItem(
+        item: Item.fromJson(json['item'] as Map<String, dynamic>),
+        deletedAt: DateTime.parse(json['deletedAt'] as String),
+      );
+}
+
+typedef SyncQueueEntry = ({String boardId, String msg});
+
+typedef ReportEntry = ({Item item, DateTime? deletedAt});
+
+enum SortColumn { number, name, description, createdAt, expiresAt }
+
+// ─── Tabel (board) ─────────────────────────────────────────────────────────────
+class Board {
+  final String id;
+  final String name;
+
+  const Board({required this.id, required this.name});
+
+  Board copyWith({String? name}) => Board(id: id, name: name ?? this.name);
+
+  Map<String, dynamic> toJson() => {'id': id, 'name': name};
+
+  factory Board.fromJson(Map<String, dynamic> json) => Board(
+        id:   json['id']   as String,
+        name: json['name'] as String,
+      );
+}
+
+// ─── Setări rezervări prin SMS (per tabel) ────────────────────────────────────
+class BookingSettingsData {
+  final bool enabled;
+  final int  durationMin;
+  final int  workStartMin; // minute de la miezul nopții
+  final int  workEndMin;
+  final Set<int> closedDays; // DateTime.weekday: 1=luni .. 7=duminică
+
+  const BookingSettingsData({
+    required this.enabled,
+    required this.durationMin,
+    required this.workStartMin,
+    required this.workEndMin,
+    required this.closedDays,
+  });
+
+  static const defaults = BookingSettingsData(
+    enabled: false,
+    durationMin: 30,
+    workStartMin: 9 * 60,
+    workEndMin: 18 * 60,
+    closedDays: {},
+  );
+
+  BookingSettingsData copyWith({
+    bool? enabled,
+    int? durationMin,
+    int? workStartMin,
+    int? workEndMin,
+    Set<int>? closedDays,
+  }) =>
+      BookingSettingsData(
+        enabled:      enabled      ?? this.enabled,
+        durationMin:  durationMin  ?? this.durationMin,
+        workStartMin: workStartMin ?? this.workStartMin,
+        workEndMin:   workEndMin   ?? this.workEndMin,
+        closedDays:   closedDays   ?? this.closedDays,
+      );
+}
+
+Future<BookingSettingsData> _loadBookingSettings(
+    SharedPreferences prefs, String boardId) async {
+  final closedStr = prefs.getString(_closedDaysKeyFor(boardId)) ?? '';
+  final closed = closedStr
+      .split(',')
+      .map((s) => int.tryParse(s.trim()))
+      .whereType<int>()
+      .toSet();
+  return BookingSettingsData(
+    enabled: prefs.getBool(_bookingEnabledKeyFor(boardId)) ??
+        BookingSettingsData.defaults.enabled,
+    durationMin: prefs.getInt(_appointmentDurationKeyFor(boardId)) ??
+        BookingSettingsData.defaults.durationMin,
+    workStartMin: prefs.getInt(_workStartKeyFor(boardId)) ??
+        BookingSettingsData.defaults.workStartMin,
+    workEndMin: prefs.getInt(_workEndKeyFor(boardId)) ??
+        BookingSettingsData.defaults.workEndMin,
+    closedDays: closed,
+  );
+}
+
+Future<void> _saveBookingSettings(String boardId, BookingSettingsData s) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_bookingEnabledKeyFor(boardId), s.enabled);
+  await prefs.setInt(_appointmentDurationKeyFor(boardId), s.durationMin);
+  await prefs.setInt(_workStartKeyFor(boardId), s.workStartMin);
+  await prefs.setInt(_workEndKeyFor(boardId), s.workEndMin);
+  await prefs.setString(_closedDaysKeyFor(boardId), s.closedDays.join(','));
+}
+
+// Încarcă lista de tabele; la prima rulare după actualizare, migrează datele
+// vechi (un singur tabel implicit) în „Tabel 1” și creează încă două goale.
+Future<List<Board>> _loadOrMigrateBoards(SharedPreferences prefs) async {
+  final boardsJson = prefs.getString(_kBoardsKey);
+  if (boardsJson != null) {
+    return (jsonDecode(boardsJson) as List<dynamic>)
+        .map((e) => Board.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  const b1 = Board(id: 'b1', name: 'Tabel 1');
+  const b2 = Board(id: 'b2', name: 'Tabel 2');
+  const b3 = Board(id: 'b3', name: 'Tabel 3');
+  const boards = [b1, b2, b3];
+
+  final legacyItems = prefs.getString(_kLegacyItemsKey);
+  if (legacyItems != null) {
+    await prefs.setString(_itemsKeyFor(b1.id), legacyItems);
+    await prefs.remove(_kLegacyItemsKey);
+  }
+  final legacyNext = prefs.getInt(_kLegacyNextNumberKey);
+  if (legacyNext != null) {
+    await prefs.setInt(_nextNumberKeyFor(b1.id), legacyNext);
+    await prefs.remove(_kLegacyNextNumberKey);
+  }
+  final legacyDeleted = prefs.getString(_kLegacyDeletedBufferKey);
+  if (legacyDeleted != null) {
+    await prefs.setString(_deletedBufferKeyFor(b1.id), legacyDeleted);
+    await prefs.remove(_kLegacyDeletedBufferKey);
+  }
+  final legacyPartner = prefs.getString(_kLegacySyncPartnerKey);
+  if (legacyPartner != null) {
+    await prefs.setString(_syncPartnerKeyFor(b1.id), legacyPartner);
+    await prefs.remove(_kLegacySyncPartnerKey);
+  }
+
+  await prefs.setString(
+      _kBoardsKey, jsonEncode(boards.map((b) => b.toJson()).toList()));
+  await prefs.setString(_kActiveBoardKey, b1.id);
+  return boards;
+}
+
+// ─── Punct de intrare ─────────────────────────────────────────────────────────
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.init();
+  runApp(const ManagementApp());
+}
+
+class ManagementApp extends StatelessWidget {
+  const ManagementApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Organizator',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF312E81),
+          brightness: Brightness.light,
+        ),
+        scaffoldBackgroundColor: const Color(0xFFF1F5F9),
+        useMaterial3: true,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Color(0xFF1E1B4B),
+          foregroundColor: Colors.white,
+          elevation: 0,
+          centerTitle: false,
+        ),
+      ),
+      home: const ManagementPage(),
+    );
+  }
+}
+
+// ─── Rând liber generat de funcția „Spatiere" (doar vizual, nu se salvează) ──
+class _FreeSlot {
+  final DateTime start;
+  final DateTime end;
+  const _FreeSlot(this.start, this.end);
+}
+
+class ManagementPage extends StatefulWidget {
+  const ManagementPage({super.key});
+  @override
+  State<ManagementPage> createState() => _ManagementPageState();
+}
+
+class _ManagementPageState extends State<ManagementPage>
+    with WidgetsBindingObserver {
+  final TextEditingController _searchController = TextEditingController();
+  bool _searchVisible = false;
+
+  final List<({SortColumn column, bool ascending})> _sortCriteria = [
+    (column: SortColumn.number, ascending: true),
+  ];
+  List<({SortColumn column, bool ascending})>? _sortCriteriaBeforeSpacing;
+  bool     _spatiereActiva  = false;
+  Duration? _spatiereInterval;
+  List<_FreeSlot> _cachedFreeSlots = [];
+  BookingSettingsData _bookingSettings = BookingSettingsData.defaults;
+  String _searchQuery  = '';
+  bool   _loading      = true;
+  int    _nextNumber   = 1;
+
+  List<Board> _boards        = [];
+  String      _activeBoardId = '';
+
+  final List<Item>        _items         = [];
+  final List<DeletedItem> _deletedBuffer = [];
+  Timer? _colorTimer;
+  String _smsTemplate = _kDefaultSmsTemplate;
+
+  // Înainte ca _loadData să termine încărcarea inițială, _boards e încă gol
+  // (Scaffold-ul cu spinner se construiește imediat) — nu explodăm în acel caz.
+  Board get _activeBoard => _boards.firstWhere(
+      (b) => b.id == _activeBoardId,
+      orElse: () => const Board(id: '', name: 'Organizator'));
+  int get _activeBoardIndex => _boards.indexWhere((b) => b.id == _activeBoardId);
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _loadData();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      NotificationService.requestPermissions();
+      SmsService.requestPermission();
+    });
+    _startColorTimer();
+  }
+
+  Future<void> _loadData() async {
+    final prefs = await SharedPreferences.getInstance();
+    _boards = await _loadOrMigrateBoards(prefs);
+    _activeBoardId = prefs.getString(_kActiveBoardKey) ?? _boards.first.id;
+    if (!_boards.any((b) => b.id == _activeBoardId)) {
+      _activeBoardId = _boards.first.id;
+    }
+
+    await SyncService.load(_activeBoardId);
+    await LicenseService.load();
+    await _loadItems();
+    await _processSyncQueue();
+    await _checkPendingLicense();
+  }
+
+  // ── Comutare / redenumire tabele ─────────────────────────────────────────────
+  Future<void> _switchBoard(String boardId) async {
+    if (boardId == _activeBoardId) return;
+    setState(() {
+      _activeBoardId = boardId;
+      _loading = true;
+      // Sloturile libere calculate erau pentru tabelul anterior — le golim ca
+      // să nu afișăm date greșite până se recalculează pentru noul tabel.
+      _spatiereActiva = false;
+      _cachedFreeSlots = [];
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kActiveBoardKey, boardId);
+    await SyncService.load(boardId);
+    await _loadItems();
+    await _processSyncQueue();
+  }
+
+  Future<void> _renameBoard(String boardId, String newName) async {
+    final trimmed = newName.trim();
+    if (trimmed.isEmpty) return;
+    setState(() {
+      _boards = _boards
+          .map((b) => b.id == boardId ? b.copyWith(name: trimmed) : b)
+          .toList();
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+        _kBoardsKey, jsonEncode(_boards.map((b) => b.toJson()).toList()));
+  }
+
+  Future<void> _showBoardMenu() async {
+    final action = await showDialog<({String action, String boardId})>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Tabele'),
+        children: _boards.map((b) {
+          final isActive = b.id == _activeBoardId;
+          // ListTile + trailing IconButton (nu SimpleDialogOption) — ca să
+          // avem două zone de tap independente și fiabile: selectarea
+          // tabelului și butonul de redenumire.
+          return ListTile(
+            onTap: () => Navigator.pop(ctx, (action: 'select', boardId: b.id)),
+            leading: Icon(
+              isActive
+                  ? Icons.radio_button_checked
+                  : Icons.radio_button_unchecked,
+              color: isActive ? const Color(0xFF1E1B4B) : Colors.grey,
+            ),
+            title: Text(
+              b.name,
+              style: TextStyle(
+                  fontWeight: isActive ? FontWeight.bold : FontWeight.normal),
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.edit_outlined, size: 18),
+              tooltip: 'Redenumește',
+              onPressed: () =>
+                  Navigator.pop(ctx, (action: 'rename', boardId: b.id)),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+
+    if (action == null) return;
+    if (action.action == 'select') {
+      await _switchBoard(action.boardId);
+    } else if (action.action == 'rename') {
+      await _showRenameBoardDialog(action.boardId);
+    }
+  }
+
+  Future<void> _showRenameBoardDialog(String boardId) async {
+    final board = _boards.firstWhere((b) => b.id == boardId);
+    final ctrl = TextEditingController(text: board.name);
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Redenumește tabelul'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+              labelText: 'Nume tabel', border: OutlineInputBorder()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Anulează'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Salvează'),
+          ),
+        ],
+      ),
+    );
+    if (saved == true) {
+      await _renameBoard(boardId, ctrl.text);
+    }
+  }
+
+  void _startColorTimer() {
+    _colorTimer?.cancel();
+    _colorTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _startColorTimer();
+        _processSyncQueue();
+        _checkPendingLicense();
+        if (mounted) setState(() {});
+      case AppLifecycleState.paused:
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
+        _colorTimer?.cancel();
+        _colorTimer = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _colorTimer?.cancel();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  // ── Persistență ─────────────────────────────────────────────────────────────
+  Future<void> _loadItems() async {
+    _items.clear();
+    _deletedBuffer.clear();
+    List<Item>? loaded;
+    int nextNumber = 1;
+    try {
+      final prefs   = await SharedPreferences.getInstance();
+      final jsonStr = prefs.getString(_itemsKeyFor(_activeBoardId));
+      nextNumber    = prefs.getInt(_nextNumberKeyFor(_activeBoardId)) ?? 1;
+      _smsTemplate  = prefs.getString(_kSmsTemplateKey) ?? _kDefaultSmsTemplate;
+      _bookingSettings = await _loadBookingSettings(prefs, _activeBoardId);
+      final deletedStr = prefs.getString(_deletedBufferKeyFor(_activeBoardId));
+      if (deletedStr != null) {
+        final deletedList = (jsonDecode(deletedStr) as List<dynamic>)
+            .map((e) => DeletedItem.fromJson(e as Map<String, dynamic>))
+            .where((d) => !d.isExpiredFromBuffer)
+            .toList();
+        _deletedBuffer.addAll(deletedList);
+      }
+      if (jsonStr != null) {
+        loaded = (jsonDecode(jsonStr) as List<dynamic>)
+            .map((e) => Item.fromJson(e as Map<String, dynamic>))
+            .toList();
+      }
+    } catch (_) {}
+
+    if (!mounted) return;
+
+    if (loaded != null) {
+      setState(() {
+        _items.addAll(loaded!);
+        _nextNumber = nextNumber;
+        _loading    = false;
+      });
+    } else if (_activeBoardId == 'b1') {
+      // Date demonstrative — doar la prima instalare, doar pentru primul tabel.
+      setState(() {
+        _items.addAll([
+          Item(syncId: _generateSyncId(), number: 1, name: 'Proiect Alpha',    description: 'Proiect principal de dezvoltare',    createdAt: DateTime(2026, 1, 10,  9,  0), expiresAt: DateTime(2026, 7,  1, 18,  0)),
+          Item(syncId: _generateSyncId(), number: 2, name: 'Raport lunar',     description: 'Raport de activitate lunară',        createdAt: DateTime(2026, 2,  1,  8, 30), expiresAt: DateTime(2026, 6, 30, 23, 59)),
+          Item(syncId: _generateSyncId(), number: 3, name: 'Întâlnire echipă', description: 'Ședință săptămânală de status',     createdAt: DateTime(2026, 3, 15, 10,  0), expiresAt: DateTime(2026, 12,31, 17,  0)),
+          Item(syncId: _generateSyncId(), number: 4, name: 'Audit intern',     description: 'Verificare proceduri interne',       createdAt: DateTime(2026, 4,  5, 11,  0), expiresAt: DateTime(2026, 8, 15, 16,  0)),
+          Item(syncId: _generateSyncId(), number: 5, name: 'Buget anual',      description: 'Planificare buget pentru 2027',      createdAt: DateTime(2026, 5, 20, 14,  0), expiresAt: DateTime(2026,11, 30, 23, 59)),
+        ]);
+        _nextNumber = 6;
+        _loading    = false;
+      });
+      await _saveItems();
+    } else {
+      // Tabel nou, fără date salvate — pornește complet gol.
+      setState(() {
+        _nextNumber = 1;
+        _loading    = false;
+      });
+    }
+  }
+
+  Future<void> _saveItems() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_itemsKeyFor(_activeBoardId),
+        jsonEncode(_items.map((e) => e.toJson()).toList()));
+    await prefs.setInt(_nextNumberKeyFor(_activeBoardId), _nextNumber);
+    unawaited(_recomputeFreeSlots());
+  }
+
+  Future<void> _saveBuffer() async {
+    _deletedBuffer.removeWhere((d) => d.isExpiredFromBuffer);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _deletedBufferKeyFor(_activeBoardId),
+      jsonEncode(_deletedBuffer.map((d) => d.toJson()).toList()),
+    );
+  }
+
+  // ── Procesare coadă sincronizare ─────────────────────────────────────────────
+  // Fiecare tabel are propriul partener SMS, deci mesajele din coadă pot
+  // aparține unui tabel diferit de cel activ (etichetate de SmsSyncReceiver
+  // cu tabelul al cărui partener configurat corespunde expeditorului).
+  Future<void> _processSyncQueue() async {
+    if (_loading) return;
+    final entries = await SyncService.getPendingMessages();
+    if (entries.isEmpty) return;
+
+    final byBoard = <String, List<String>>{};
+    for (final e in entries) {
+      final boardId = e.boardId.isEmpty ? 'b1' : e.boardId;
+      byBoard.putIfAbsent(boardId, () => []).add(e.msg);
+    }
+
+    for (final entry in byBoard.entries) {
+      final boardIndex = _boards.indexWhere((b) => b.id == entry.key);
+      if (boardIndex == -1) continue; // tabel necunoscut — ignorat
+      await _mergeSyncMessages(entry.key, boardIndex, entry.value);
+    }
+
+    await SyncService.clearQueue();
+  }
+
+  // Aplică mesajele de sincronizare peste tabelul indicat. Dacă e tabelul
+  // activ, operează direct pe starea din memorie (_items); altfel încarcă,
+  // modifică și salvează datele acelui tabel fără să afecteze ecranul curent.
+  Future<void> _mergeSyncMessages(
+    String boardId,
+    int boardIndex,
+    List<String> messages,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final isActiveBoard = boardId == _activeBoardId;
+
+    List<Item> items;
+    List<DeletedItem> deletedBuffer;
+    int nextNumber;
+
+    if (isActiveBoard) {
+      items = _items;
+      deletedBuffer = _deletedBuffer;
+      nextNumber = _nextNumber;
+    } else {
+      items = [];
+      deletedBuffer = [];
+      final jsonStr = prefs.getString(_itemsKeyFor(boardId));
+      if (jsonStr != null) {
+        items = (jsonDecode(jsonStr) as List<dynamic>)
+            .map((e) => Item.fromJson(e as Map<String, dynamic>))
+            .toList();
+      }
+      nextNumber = prefs.getInt(_nextNumberKeyFor(boardId)) ?? (items.length + 1);
+      final deletedStr = prefs.getString(_deletedBufferKeyFor(boardId));
+      if (deletedStr != null) {
+        deletedBuffer = (jsonDecode(deletedStr) as List<dynamic>)
+            .map((e) => DeletedItem.fromJson(e as Map<String, dynamic>))
+            .where((d) => !d.isExpiredFromBuffer)
+            .toList();
+      }
+    }
+
+    bool changed = false;
+    for (final msg in messages) {
+      try {
+        if (msg.startsWith('ORG:A:') || msg.startsWith('ORG:I:')) {
+          final prefix = msg.startsWith('ORG:A:') ? 'ORG:A:' : 'ORG:I:';
+          final j = jsonDecode(msg.substring(prefix.length)) as Map<String, dynamic>;
+          final incoming = Item.fromSyncJson(j);
+          final idx = items.indexWhere((e) => e.syncId == incoming.syncId);
+          if (idx == -1) {
+            items.add(incoming.copyWith(number: nextNumber++));
+          } else {
+            items[idx] = incoming.copyWith(number: items[idx].number);
+          }
+          changed = true;
+        } else if (msg.startsWith('ORG:U:')) {
+          final j = jsonDecode(msg.substring(6)) as Map<String, dynamic>;
+          final incoming = Item.fromSyncJson(j);
+          final idx = items.indexWhere((e) => e.syncId == incoming.syncId);
+          if (idx != -1) {
+            items[idx] = incoming.copyWith(number: items[idx].number);
+          } else {
+            // Item necunoscut primit ca update → adăugat
+            items.add(incoming.copyWith(number: nextNumber++));
+          }
+          changed = true;
+        } else if (msg.startsWith('ORG:D:')) {
+          final syncId = msg.substring(6).trim();
+          final idx = items.indexWhere((e) => e.syncId == syncId);
+          if (idx != -1) {
+            deletedBuffer.add(
+                DeletedItem(item: items[idx], deletedAt: DateTime.now()));
+            items.removeAt(idx);
+            changed = true;
+          }
+        }
+        // ORG:Z: (end of initial sync) — ignorat, nu necesită acțiune
+      } catch (_) {
+        // SMS corupt sau format necunoscut — ignorat
+      }
+    }
+
+    if (!changed) return;
+
+    // Anulăm alarmele vechi (SMS + notificări) pentru orice item care își
+    // schimbă numărul la renumerotare — altfel rămân alarme "orfane"
+    // programate sub numărul vechi, iar noul număr nu are nicio alarmă.
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].number != i + 1) {
+        await NotificationService.cancelFor(items[i].number,
+            boardIndex: boardIndex);
+        SmsService.cancelFor(items[i].number, boardIndex: boardIndex);
+      }
+    }
+    // Renumerotare secvențială după orice modificare prin sync
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].number != i + 1) {
+        items[i] = items[i].copyWith(number: i + 1);
+      }
+    }
+    nextNumber = items.length + 1;
+    deletedBuffer.removeWhere((d) => d.isExpiredFromBuffer);
+
+    await prefs.setString(
+        _itemsKeyFor(boardId), jsonEncode(items.map((e) => e.toJson()).toList()));
+    await prefs.setInt(_nextNumberKeyFor(boardId), nextNumber);
+    await prefs.setString(_deletedBufferKeyFor(boardId),
+        jsonEncode(deletedBuffer.map((d) => d.toJson()).toList()));
+
+    // Reprogramează notificările locale pentru toate înregistrările tabelului
+    for (final item in items) {
+      await NotificationService.scheduleFor(item, boardIndex: boardIndex);
+      await SmsService.scheduleFor(item,
+          template: _smsTemplate, boardIndex: boardIndex);
+    }
+
+    if (isActiveBoard) {
+      _nextNumber = nextNumber;
+      if (mounted) setState(() {});
+      unawaited(_recomputeFreeSlots());
+    }
+  }
+
+  // ── Activare licență prin fișier .orgtoken ───────────────────────────────────
+  Future<void> _checkPendingLicense() async {
+    if (LicenseService.isLicensed) return;
+    final token = await LicenseService.getPendingToken();
+    if (token != null && mounted) {
+      await _showActivationDialog(token);
+    }
+  }
+
+  Future<void> _showActivationDialog(String tokenJson) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Row(children: [
+          Icon(Icons.vpn_key, color: Color(0xFF1E1B4B)),
+          SizedBox(width: 8),
+          Text('Activare Licență'),
+        ]),
+        content: const Text(
+          'A fost detectat un fișier de licență Organizator.\n\n'
+          'Doriți să activați aplicația acum?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Anulează'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Activează'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    final r = await LicenseService.activate(tokenJson);
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(r.message),
+        backgroundColor: r.success ? Colors.green.shade700 : Colors.red.shade700,
+        duration: const Duration(seconds: 4),
+      ),
+    );
+    if (r.success) setState(() {});
+  }
+
+  void _showLicenseRequiredDialog() async {
+    final businessId = await LicenseService.getBusinessId();
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Row(children: [
+          Icon(Icons.lock_outline, color: Colors.orange),
+          SizedBox(width: 8),
+          Text('Licență necesară'),
+        ]),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Perioada de trial gratuită de 1 lună a expirat.',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Cumpără o licență pe voltacademy.app/organizator.html folosind codul de instalare de mai jos, apoi importă fișierul descărcat:',
+                style: TextStyle(fontSize: 13),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEEF2FF),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFFC7D2FE)),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: SelectableText(
+                        businessId,
+                        style: const TextStyle(fontSize: 12, fontFamily: 'monospace', color: Color(0xFF3730A3)),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.copy, size: 18),
+                      tooltip: 'Copiază codul',
+                      onPressed: () async {
+                        await Clipboard.setData(ClipboardData(text: businessId));
+                        if (ctx.mounted) {
+                          ScaffoldMessenger.of(ctx).showSnackBar(
+                            const SnackBar(content: Text('Cod copiat.')),
+                          );
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                icon: const Icon(Icons.folder_open),
+                label: const Text('Select License File'),
+                onPressed: () async {
+                  final ok = await LicenseService.pickLicenseFile();
+                  if (!ctx.mounted) return;
+                  ScaffoldMessenger.of(ctx).showSnackBar(
+                    SnackBar(
+                      content: Text(ok
+                          ? 'Licență activată cu succes!'
+                          : (LicenseService.newLicenseMessage.isNotEmpty
+                              ? LicenseService.newLicenseMessage
+                              : 'Fișierul selectat nu este o licență validă.')),
+                      backgroundColor: ok ? Colors.green.shade700 : Colors.red.shade700,
+                    ),
+                  );
+                  if (ok) {
+                    Navigator.pop(ctx);
+                    if (mounted) setState(() {});
+                  }
+                },
+              ),
+              const SizedBox(height: 16),
+              const Divider(),
+              const SizedBox(height: 8),
+              const Text(
+                'Ai deja un fișier .orgtoken vechi de la Volt Academy?\n'
+                'Deschide-l din WhatsApp sau Files și alege "Organizator".',
+                style: TextStyle(fontSize: 11, color: Colors.grey),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Închide'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Filtrare și sortare ──────────────────────────────────────────────────────
+  List<Item> get _filteredAndSorted {
+    var result = _items.where((item) {
+      if (_searchQuery.isEmpty) return true;
+      final q = _searchQuery.toLowerCase();
+      return item.number.toString().contains(q) ||
+          item.name.toLowerCase().contains(q) ||
+          item.description.toLowerCase().contains(q) ||
+          _formatDateTime(item.createdAt).contains(q) ||
+          (item.expiresAt != null && _formatDateTime(item.expiresAt!).contains(q));
+    }).toList();
+
+    result.sort((a, b) {
+      for (final c in _sortCriteria) {
+        final cmp = _compareItems(a, b, c.column);
+        if (cmp != 0) return c.ascending ? cmp : -cmp;
+      }
+      return 0;
+    });
+    return result;
+  }
+
+  bool _isExpired(Item item) =>
+      item.expiresAt != null && item.expiresAt!.isBefore(DateTime.now());
+
+  bool _isWarning(Item item) =>
+      !_isExpired(item) &&
+      item.warningAt != null &&
+      item.warningAt!.isBefore(DateTime.now());
+
+  Color _rowBg(Item item, bool isEven) {
+    if (_isExpired(item)) return const Color(0xFFFFDADA);
+    if (_isWarning(item)) return const Color(0xFFFEF3C7);
+    return isEven ? Colors.white : const Color(0xFFF8FAFC);
+  }
+
+  String _formatDateTime(DateTime dt) =>
+      '${dt.day.toString().padLeft(2, '0')}.'
+      '${dt.month.toString().padLeft(2, '0')}.'
+      '${dt.year} '
+      '${dt.hour.toString().padLeft(2, '0')}:'
+      '${dt.minute.toString().padLeft(2, '0')}';
+
+  int _compareItems(Item a, Item b, SortColumn col) {
+    switch (col) {
+      case SortColumn.number:      return a.number.compareTo(b.number);
+      case SortColumn.name:        return a.name.compareTo(b.name);
+      case SortColumn.description: return a.description.compareTo(b.description);
+      case SortColumn.createdAt:   return a.createdAt.compareTo(b.createdAt);
+      case SortColumn.expiresAt:
+        if (a.expiresAt == null && b.expiresAt == null) return 0;
+        if (a.expiresAt == null) return 1;
+        if (b.expiresAt == null) return -1;
+        return a.expiresAt!.compareTo(b.expiresAt!);
+    }
+  }
+
+  void _onSort(SortColumn column) {
+    setState(() {
+      final idx = _sortCriteria.indexWhere((c) => c.column == column);
+      if (idx == -1) {
+        _sortCriteria.add((column: column, ascending: true));
+      } else if (_sortCriteria[idx].ascending) {
+        _sortCriteria[idx] = (column: column, ascending: false);
+      } else {
+        _sortCriteria.removeAt(idx);
+      }
+    });
+  }
+
+  // ── Spatiere (rânduri libere între programări, doar vizual) ─────────────────
+  Future<void> _toggleSpatiere() async {
+    if (_spatiereActiva) {
+      setState(() {
+        _spatiereActiva = false;
+        _cachedFreeSlots = [];
+        if (_sortCriteriaBeforeSpacing != null) {
+          _sortCriteria
+            ..clear()
+            ..addAll(_sortCriteriaBeforeSpacing!);
+          _sortCriteriaBeforeSpacing = null;
+        }
+      });
+      return;
+    }
+
+    final interval = await _showSpatiereDialog();
+    if (interval == null) return;
+
+    setState(() {
+      _spatiereInterval = interval;
+      _spatiereActiva = true;
+      _sortCriteriaBeforeSpacing = List.of(_sortCriteria);
+      _sortCriteria
+        ..clear()
+        ..add((column: SortColumn.expiresAt, ascending: true));
+    });
+
+    // Durata devine setarea persistentă a tabelului — folosită și de botul de
+    // rezervări prin SMS, ca să nu existe două valori diferite pentru „cât
+    // durează o programare”.
+    if (interval.inMinutes != _bookingSettings.durationMin) {
+      final updated = _bookingSettings.copyWith(durationMin: interval.inMinutes);
+      setState(() => _bookingSettings = updated);
+      await _saveBookingSettings(_activeBoardId, updated);
+    }
+    await _recomputeFreeSlots();
+  }
+
+  Future<Duration?> _showSpatiereDialog() async {
+    Duration selected = _spatiereInterval ??
+        Duration(minutes: _bookingSettings.durationMin);
+    const presets = [
+      Duration(minutes: 15),
+      Duration(minutes: 30),
+      Duration(hours: 1),
+      Duration(hours: 2),
+    ];
+    bool custom = !presets.contains(selected);
+    final hoursCtrl = TextEditingController(
+        text: selected.inHours.toString());
+    final minutesCtrl = TextEditingController(
+        text: (selected.inMinutes % 60).toString());
+
+    return showDialog<Duration>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDs) {
+          String label(Duration d) {
+            if (d.inMinutes < 60) return '${d.inMinutes} min';
+            final h = d.inMinutes ~/ 60;
+            final m = d.inMinutes % 60;
+            return m == 0 ? '$h ${h == 1 ? "oră" : "ore"}' : '${h}h ${m}min';
+          }
+
+          Widget presetChip(Duration d) => ChoiceChip(
+                label: Text(label(d)),
+                selected: !custom && selected == d,
+                onSelected: (_) => setDs(() {
+                  selected = d;
+                  custom = false;
+                }),
+              );
+
+          return AlertDialog(
+            title: const Text('Spatiere'),
+            content: SizedBox(
+              width: 360,
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Alege intervalul dintre programări. Tabelul va afișa '
+                      'rândurile libere dintre programările existente '
+                      '(sortate după ora de expirare).',
+                      style: TextStyle(fontSize: 13, color: Colors.black54),
+                    ),
+                    const SizedBox(height: 14),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        ...presets.map(presetChip),
+                        ChoiceChip(
+                          label: const Text('Personalizat'),
+                          selected: custom,
+                          onSelected: (_) => setDs(() => custom = true),
+                        ),
+                      ],
+                    ),
+                    if (custom) ...[
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: hoursCtrl,
+                              keyboardType: TextInputType.number,
+                              decoration: const InputDecoration(
+                                labelText: 'Ore',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: TextField(
+                              controller: minutesCtrl,
+                              keyboardType: TextInputType.number,
+                              decoration: const InputDecoration(
+                                labelText: 'Minute',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Anulează'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  var result = selected;
+                  if (custom) {
+                    final h = int.tryParse(hoursCtrl.text.trim()) ?? 0;
+                    final m = int.tryParse(minutesCtrl.text.trim()) ?? 0;
+                    result = Duration(hours: h, minutes: m);
+                  }
+                  if (result <= Duration.zero) return;
+                  Navigator.pop(ctx, result);
+                },
+                child: const Text('Aplică'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  // Intercalează sloturile libere deja calculate (_cachedFreeSlots, sortate
+  // crescător după oră de start) cu programările (sortate după expiresAt), în
+  // ordine cronologică — inclusiv sloturile de dinaintea primei programări sau
+  // de după ultima (limitate de programul de lucru configurat).
+  List<Object> _withFreeSlots(List<Item> sortedByExpiry) {
+    if (!_spatiereActiva || _cachedFreeSlots.isEmpty) return sortedByExpiry;
+
+    final result = <Object>[];
+    var slotIdx = 0;
+    for (final item in sortedByExpiry) {
+      if (item.expiresAt != null) {
+        while (slotIdx < _cachedFreeSlots.length &&
+            _cachedFreeSlots[slotIdx].start.isBefore(item.expiresAt!)) {
+          result.add(_cachedFreeSlots[slotIdx]);
+          slotIdx++;
+        }
+      }
+      result.add(item);
+    }
+    while (slotIdx < _cachedFreeSlots.length) {
+      result.add(_cachedFreeSlots[slotIdx]);
+      slotIdx++;
+    }
+    return result;
+  }
+
+  // Recalculează sloturile libere pentru tabelul activ. Pe Android delegă
+  // integral către codul nativ (aceeași sursă de adevăr ca botul de rezervări
+  // prin SMS); pe celelalte platforme (unde nu există bot SMS, deci nimic cu
+  // care să diverge) folosește implementarea locală de mai jos.
+  Future<void> _recomputeFreeSlots() async {
+    if (!_spatiereActiva) {
+      if (_cachedFreeSlots.isNotEmpty) setState(() => _cachedFreeSlots = []);
+      return;
+    }
+    final slots = Platform.isAndroid
+        ? await SmsService._computeFreeSlots(_activeBoardId)
+        : _computeFreeSlotsLocal();
+    if (!mounted) return;
+    setState(() => _cachedFreeSlots = slots);
+  }
+
+  // Implementare de rezervă (non-Android) — aceeași logică ca FreeSlotCalculator
+  // din Kotlin: sloturile se aliniază la începutul programului de lucru sau la
+  // finalul programării anterioare, respectând zilele închise.
+  List<_FreeSlot> _computeFreeSlotsLocal() {
+    final interval = _spatiereInterval;
+    if (interval == null || interval <= Duration.zero) return [];
+    final durationMin = interval.inMinutes;
+
+    final busy = _items
+        .where((i) => i.expiresAt != null)
+        .map((i) => (start: i.expiresAt!.subtract(interval), end: i.expiresAt!))
+        .toList()
+      ..sort((a, b) => a.start.compareTo(b.start));
+
+    final result = <_FreeSlot>[];
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    const horizonDays = 14;
+    const maxResults = 200;
+
+    for (var d = 0; d <= horizonDays && result.length < maxResults; d++) {
+      final date = today.add(Duration(days: d));
+      if (_bookingSettings.closedDays.contains(date.weekday)) continue;
+
+      final dayStart = date.add(Duration(minutes: _bookingSettings.workStartMin));
+      final dayEnd   = date.add(Duration(minutes: _bookingSettings.workEndMin));
+      var cursor = dayStart.isBefore(now)
+          ? _roundUpToSlot(now, dayStart, durationMin)
+          : dayStart;
+
+      final dayBusy =
+          busy.where((b) => b.end.isAfter(dayStart) && b.start.isBefore(dayEnd));
+      for (final b in dayBusy) {
+        if (result.length >= maxResults) break;
+        final busyStart = b.start.isBefore(cursor) ? cursor : b.start;
+        while (result.length < maxResults &&
+            !cursor.add(interval).isAfter(busyStart)) {
+          result.add(_FreeSlot(cursor, cursor.add(interval)));
+          cursor = cursor.add(interval);
+        }
+        if (b.end.isAfter(cursor)) cursor = b.end;
+      }
+      while (result.length < maxResults && !cursor.add(interval).isAfter(dayEnd)) {
+        result.add(_FreeSlot(cursor, cursor.add(interval)));
+        cursor = cursor.add(interval);
+      }
+    }
+    return result;
+  }
+
+  DateTime _roundUpToSlot(DateTime from, DateTime dayStart, int durationMin) {
+    if (!from.isAfter(dayStart)) return dayStart;
+    final minutesFromStart = from.difference(dayStart).inMinutes;
+    final slots = (minutesFromStart + durationMin - 1) ~/ durationMin;
+    return dayStart.add(Duration(minutes: slots * durationMin));
+  }
+
+  Widget _buildSortIcon(SortColumn column) {
+    final idx = _sortCriteria.indexWhere((c) => c.column == column);
+    if (idx == -1) {
+      return const Icon(Icons.unfold_more, size: 16, color: Colors.white54);
+    }
+    final isAsc   = _sortCriteria[idx].ascending;
+    final showNum = _sortCriteria.length > 1;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          isAsc ? Icons.arrow_upward : Icons.arrow_downward,
+          size: 14, color: Colors.white,
+        ),
+        if (showNum)
+          Padding(
+            padding: const EdgeInsets.only(left: 1),
+            child: Text(
+              '${idx + 1}',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 9,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildHeaderCell(String label, SortColumn column, {double? width}) {
+    return InkWell(
+      onTap: () => _onSort(column),
+      child: Container(
+        width: width,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Flexible(
+              child: Text(label,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13)),
+            ),
+            const SizedBox(width: 4),
+            _buildSortIcon(column),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Dialog adăugare / editare ────────────────────────────────────────────────
+  Future<void> _showItemDialog({Item? existing}) async {
+    final isEdit  = existing != null;
+    // Verificare limită versiune gratuită (doar la adăugare, nu la editare)
+    if (!isEdit && !LicenseService.canAdd) {
+      _showLicenseRequiredDialog();
+      return;
+    }
+    final nameCtrl = TextEditingController(text: existing?.name ?? '');
+    final descCtrl = TextEditingController(text: existing?.description ?? '');
+    DateTime? selectedExpiry = existing?.expiresAt;
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDs) => AlertDialog(
+          title: Text(isEdit ? 'Editează înregistrarea' : 'Adaugă înregistrare'),
+          content: SizedBox(
+            width: 400,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: nameCtrl,
+                    decoration: const InputDecoration(
+                        labelText: 'Nume *', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: descCtrl,
+                    decoration: const InputDecoration(
+                        labelText: 'Descriere', border: OutlineInputBorder()),
+                    maxLines: 3,
+                  ),
+                  const SizedBox(height: 12),
+                  _buildDatePickerRow(
+                    label: selectedExpiry == null
+                        ? 'Data expirare: nesetată'
+                        : 'Expirare: ${_formatDateTime(selectedExpiry!)}',
+                    hasValue: selectedExpiry != null,
+                    onClear: () => setDs(() => selectedExpiry = null),
+                    onPick: () async {
+                      final date = await showDatePicker(
+                        context: ctx,
+                        initialDate: selectedExpiry ?? DateTime.now(),
+                        firstDate: DateTime(2020), lastDate: DateTime(2100),
+                      );
+                      if (date == null) return;
+                      if (!ctx.mounted) return;
+                      final time = await showTimePicker(
+                        context: ctx,
+                        initialTime: selectedExpiry != null
+                            ? TimeOfDay(
+                                hour: selectedExpiry!.hour,
+                                minute: selectedExpiry!.minute)
+                            : TimeOfDay.now(),
+                      );
+                      if (time == null) return;
+                      setDs(() => selectedExpiry = DateTime(
+                          date.year, date.month, date.day,
+                          time.hour, time.minute));
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Anulează'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final name = nameCtrl.text.trim();
+                final desc = descCtrl.text.trim();
+                if (name.isEmpty) return;
+                setState(() {
+                  if (isEdit) {
+                    final idx =
+                        _items.indexWhere((e) => e.number == existing.number);
+                    if (idx != -1) {
+                      _items[idx] = existing.copyWith(
+                        name: name,
+                        description: desc,
+                        expiresAt: selectedExpiry,
+                        clearExpiry: selectedExpiry == null,
+                      );
+                    }
+                  } else {
+                    _items.add(Item(
+                      syncId:      _generateSyncId(),
+                      number:      _nextNumber++,
+                      name:        name,
+                      description: desc,
+                      createdAt:   DateTime.now(),
+                      expiresAt:   selectedExpiry,
+                    ));
+                  }
+                });
+                Navigator.pop(ctx, true);
+              },
+              child: Text(isEdit ? 'Salvează' : 'Adaugă'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (saved == true) {
+      Item? changedItem;
+      if (isEdit) {
+        changedItem = _items.firstWhere(
+            (e) => e.number == existing.number, orElse: () => existing);
+        await NotificationService.scheduleFor(changedItem,
+            boardIndex: _activeBoardIndex);
+        await SmsService.scheduleFor(changedItem,
+            template: _smsTemplate, boardIndex: _activeBoardIndex);
+        await SyncService.sendUpdate(changedItem);
+      } else if (_items.isNotEmpty) {
+        changedItem = _items.reduce((a, b) => a.number > b.number ? a : b);
+        await NotificationService.scheduleFor(changedItem,
+            boardIndex: _activeBoardIndex);
+        await SmsService.scheduleFor(changedItem,
+            template: _smsTemplate, boardIndex: _activeBoardIndex);
+        await SyncService.sendAdd(changedItem);
+      }
+      await _saveItems();
+    }
+  }
+
+  // ── Dialog alertă + SMS ──────────────────────────────────────────────────────
+  Future<void> _showWarningDialog(Item item) async {
+    DateTime? selectedWarning = item.warningAt;
+    if (selectedWarning == null && item.expiresAt != null) {
+      final candidate = item.expiresAt!.subtract(const Duration(hours: 1));
+      if (candidate.isAfter(DateTime.now())) {
+        selectedWarning = candidate;
+      }
+    }
+    final phone1Ctrl = TextEditingController(text: item.phoneNumber  ?? '');
+    final phone2Ctrl = TextEditingController(text: item.phoneNumber2 ?? '');
+    final phone3Ctrl = TextEditingController(text: item.phoneNumber3 ?? '');
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDs) => AlertDialog(
+          title: const Text('Setează alertă & SMS'),
+          content: SizedBox(
+            width: 400,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(item.name,
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w600, fontSize: 15)),
+                  if (item.expiresAt != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        'Expiră la: ${_formatDateTime(item.expiresAt!)}',
+                        style: TextStyle(
+                            fontSize: 12, color: Colors.grey.shade600),
+                      ),
+                    ),
+                  const SizedBox(height: 16),
+                  _buildDatePickerRow(
+                    label: selectedWarning == null
+                        ? 'Alertă: nesetată'
+                        : 'Alertă la: ${_formatDateTime(selectedWarning!)}',
+                    hasValue: selectedWarning != null,
+                    icon: Icons.alarm,
+                    onClear: () => setDs(() => selectedWarning = null),
+                    onPick: () async {
+                      final date = await showDatePicker(
+                        context: ctx,
+                        initialDate: selectedWarning ?? DateTime.now(),
+                        firstDate: DateTime(2020), lastDate: DateTime(2100),
+                      );
+                      if (date == null) return;
+                      if (!ctx.mounted) return;
+                      final time = await showTimePicker(
+                        context: ctx,
+                        initialTime: selectedWarning != null
+                            ? TimeOfDay(
+                                hour: selectedWarning!.hour,
+                                minute: selectedWarning!.minute)
+                            : TimeOfDay.now(),
+                      );
+                      if (time == null) return;
+                      setDs(() => selectedWarning = DateTime(
+                          date.year, date.month, date.day,
+                          time.hour, time.minute));
+                    },
+                  ),
+                  if (selectedWarning != null &&
+                      item.expiresAt != null &&
+                      selectedWarning!.isAfter(item.expiresAt!))
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text(
+                        '⚠️  Alerta este setată după data de expirare.',
+                        style: TextStyle(
+                            color: Colors.orange.shade700, fontSize: 12),
+                      ),
+                    ),
+                  const SizedBox(height: 16),
+                  const Divider(),
+                  const SizedBox(height: 8),
+                  _phoneField(phone1Ctrl, 'Telefon 1 (opțional)', setDs),
+                  const SizedBox(height: 10),
+                  _phoneField(phone2Ctrl, 'Telefon 2 (opțional)', setDs),
+                  const SizedBox(height: 10),
+                  _phoneField(phone3Ctrl, 'Telefon 3 (opțional)', setDs),
+                  const SizedBox(height: 6),
+                  Text(
+                    'SMS trimis automat la toate numerele completate.',
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Anulează'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final p1  = phone1Ctrl.text.trim();
+                final p2  = phone2Ctrl.text.trim();
+                final p3  = phone3Ctrl.text.trim();
+                final idx = _items.indexWhere((e) => e.number == item.number);
+                if (idx != -1) {
+                  setState(() {
+                    _items[idx] = item.copyWith(
+                      warningAt:    selectedWarning,
+                      clearWarning: selectedWarning == null,
+                      phoneNumber:  p1.isNotEmpty ? p1 : null, clearPhone:  p1.isEmpty,
+                      phoneNumber2: p2.isNotEmpty ? p2 : null, clearPhone2: p2.isEmpty,
+                      phoneNumber3: p3.isNotEmpty ? p3 : null, clearPhone3: p3.isEmpty,
+                    );
+                  });
+                }
+                Navigator.pop(ctx, true);
+              },
+              child: const Text('Salvează'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (confirmed == true) {
+      final updated = _items.firstWhere(
+          (e) => e.number == item.number, orElse: () => item);
+      await NotificationService.scheduleFor(updated,
+          boardIndex: _activeBoardIndex);
+      await SmsService.scheduleFor(updated,
+          template: _smsTemplate, boardIndex: _activeBoardIndex);
+      await SyncService.sendUpdate(updated);
+      await _saveItems();
+    }
+  }
+
+  // ── Ștergere ─────────────────────────────────────────────────────────────────
+  Future<void> _confirmDelete(Item item) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Șterge înregistrare'),
+        content: Text('Ești sigur că vrei să ștergi "${item.name}"?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Anulează'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Șterge'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      final syncId = item.syncId; // salvăm înainte de ștergere
+      await NotificationService.cancelFor(item.number,
+          boardIndex: _activeBoardIndex);
+      SmsService.cancelFor(item.number, boardIndex: _activeBoardIndex);
+      _deletedBuffer.add(DeletedItem(item: item, deletedAt: DateTime.now()));
+
+      // Reținem înregistrările care își schimbă numărul la renumerotare,
+      // ca să le anulăm și reprogramăm alarmele sub noul număr.
+      final renumbered = <Item>[];
+      setState(() {
+        _items.removeWhere((e) => e.number == item.number);
+        for (var i = 0; i < _items.length; i++) {
+          if (_items[i].number != i + 1) {
+            renumbered.add(_items[i]);
+            _items[i] = _items[i].copyWith(number: i + 1);
+          }
+        }
+        _nextNumber = _items.length + 1;
+      });
+
+      // Alarmele erau programate sub numărul vechi — le anulăm și le
+      // reprogramăm sub noul număr, altfel rămân orfane sau lipsesc.
+      for (final oldItem in renumbered) {
+        await NotificationService.cancelFor(oldItem.number,
+            boardIndex: _activeBoardIndex);
+        SmsService.cancelFor(oldItem.number, boardIndex: _activeBoardIndex);
+      }
+      for (final oldItem in renumbered) {
+        final newItem =
+            _items.firstWhere((e) => e.syncId == oldItem.syncId);
+        await NotificationService.scheduleFor(newItem,
+            boardIndex: _activeBoardIndex);
+        await SmsService.scheduleFor(newItem,
+            template: _smsTemplate, boardIndex: _activeBoardIndex);
+      }
+
+      await SyncService.sendDelete(syncId);
+      await _saveItems();
+      await _saveBuffer();
+    }
+  }
+
+  // ── Dialog rezervări prin SMS ────────────────────────────────────────────────
+  Future<void> _showBookingSettingsDialog() async {
+    bool enabled = _bookingSettings.enabled;
+    TimeOfDay workStart = TimeOfDay(
+        hour: _bookingSettings.workStartMin ~/ 60,
+        minute: _bookingSettings.workStartMin % 60);
+    TimeOfDay workEnd = TimeOfDay(
+        hour: _bookingSettings.workEndMin ~/ 60,
+        minute: _bookingSettings.workEndMin % 60);
+    final closedDays = Set<int>.of(_bookingSettings.closedDays);
+
+    const dayLabels = {
+      1: 'L', 2: 'Ma', 3: 'Mi', 4: 'J', 5: 'V', 6: 'S', 7: 'D',
+    };
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDs) => AlertDialog(
+          title: const Text('Rezervări prin SMS'),
+          content: SizedBox(
+            width: 360,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Clienții pot trimite SMS cu "liber" (opțional urmat de '
+                    'numele tabelului, ex. "liber pensat") ca să primească '
+                    'ore disponibile și să rezerve direct prin SMS, '
+                    'răspunzând cu numărul opțiunii.',
+                    style: TextStyle(fontSize: 13, color: Colors.black54),
+                  ),
+                  const SizedBox(height: 10),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Activ pentru acest tabel'),
+                    value: enabled,
+                    onChanged: (v) => setDs(() => enabled = v),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Deschidere'),
+                          subtitle: Text(workStart.format(context)),
+                          onTap: () async {
+                            final t = await showTimePicker(
+                                context: ctx, initialTime: workStart);
+                            if (t != null) setDs(() => workStart = t);
+                          },
+                        ),
+                      ),
+                      Expanded(
+                        child: ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text('Închidere'),
+                          subtitle: Text(workEnd.format(context)),
+                          onTap: () async {
+                            final t = await showTimePicker(
+                                context: ctx, initialTime: workEnd);
+                            if (t != null) setDs(() => workEnd = t);
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text('Zile închise',
+                      style:
+                          TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 6,
+                    children: dayLabels.entries.map((e) {
+                      final selected = closedDays.contains(e.key);
+                      return FilterChip(
+                        label: Text(e.value),
+                        selected: selected,
+                        onSelected: (sel) => setDs(() {
+                          if (sel) {
+                            closedDays.add(e.key);
+                          } else {
+                            closedDays.remove(e.key);
+                          }
+                        }),
+                      );
+                    }).toList(),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Anulează'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Salvează'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (saved != true) return;
+
+    final startMin = workStart.hour * 60 + workStart.minute;
+    final endMin = workEnd.hour * 60 + workEnd.minute;
+    if (endMin <= startMin) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content:
+              Text('Ora de închidere trebuie să fie după cea de deschidere.'),
+        ));
+      }
+      return;
+    }
+
+    final updated = _bookingSettings.copyWith(
+      enabled: enabled,
+      workStartMin: startMin,
+      workEndMin: endMin,
+      closedDays: closedDays,
+    );
+    setState(() => _bookingSettings = updated);
+    await _saveBookingSettings(_activeBoardId, updated);
+    await _recomputeFreeSlots();
+  }
+
+  // ── Dialog sincronizare dispozitiv ───────────────────────────────────────────
+  Future<void> _showSyncDialog() async {
+    final phoneCtrl =
+        TextEditingController(text: SyncService.partnerPhone ?? '');
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDs) => AlertDialog(
+          title: Row(
+            children: [
+              Icon(
+                SyncService.isActive ? Icons.sync : Icons.sync_disabled,
+                color: SyncService.isActive
+                    ? Colors.green.shade600
+                    : Colors.grey,
+                size: 22,
+              ),
+              const SizedBox(width: 8),
+              Text('Sincronizare · ${_activeBoard.name}'),
+            ],
+          ),
+          content: SizedBox(
+            width: 400,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (SyncService.isActive) ...[
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.green.shade50,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.green.shade200),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(Icons.check_circle_outline,
+                              color: Colors.green.shade700, size: 20),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Sincronizare activă cu:\n${SyncService.partnerPhone}',
+                              style: TextStyle(
+                                  color: Colors.green.shade800,
+                                  fontSize: 13),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      'Modificările se trimit automat prin SMS la fiecare schimbare.',
+                      style: TextStyle(
+                          fontSize: 12, color: Colors.grey.shade600),
+                    ),
+                  ] else ...[
+                    TextField(
+                      controller: phoneCtrl,
+                      keyboardType: TextInputType.phone,
+                      decoration: const InputDecoration(
+                        labelText: 'Număr telefon partener *',
+                        hintText: '+40712345678',
+                        border: OutlineInputBorder(),
+                        prefixIcon: Icon(Icons.phone_outlined),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.shade50,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.blue.shade100),
+                      ),
+                      child: Text(
+                        'La prima sincronizare, toate înregistrările de pe acest '
+                        'dispozitiv vor fi trimise prin SMS. Ulterior, fiecare '
+                        'modificare va fi sincronizată automat.\n\n'
+                        'Configurează sincronizarea și pe celălalt dispozitiv '
+                        'pentru a primi și de acolo.',
+                        style: TextStyle(
+                            fontSize: 11, color: Colors.blue.shade700),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            if (SyncService.isActive)
+              TextButton.icon(
+                icon: const Icon(Icons.sync_disabled, color: Colors.red, size: 18),
+                label: const Text('Desincronizează',
+                    style: TextStyle(color: Colors.red)),
+                onPressed: () async {
+                  await SyncService.clearPartner();
+                  setDs(() {});
+                  if (ctx.mounted) Navigator.pop(ctx);
+                  setState(() {});
+                },
+              ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Închide'),
+            ),
+            if (!SyncService.isActive)
+              FilledButton.icon(
+                icon: const Icon(Icons.sync, size: 18),
+                label: const Text('Sincronizează'),
+                onPressed: () async {
+                  final phone = phoneCtrl.text.trim();
+                  if (phone.isEmpty) return;
+                  await SyncService.setPartner(phone);
+                  setDs(() {});
+                  if (ctx.mounted) Navigator.pop(ctx);
+                  setState(() {});
+                  _performInitialSync();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _performInitialSync() async {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+            'Trimitere sincronizare inițială (${_items.length} înregistrări)...'),
+        duration: Duration(seconds: _items.length * 2 + 3),
+      ),
+    );
+    await SyncService.sendInitialSync(_items);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Sincronizare inițială trimisă!'),
+        duration: Duration(seconds: 3),
+      ),
+    );
+  }
+
+  // ── Dialog detalii ───────────────────────────────────────────────────────────
+  void _showItemDetail(Item item) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(item.name),
+        content: SizedBox(
+          width: 400,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _detailRow('Nr.', item.number.toString()),
+              const SizedBox(height: 10),
+              _detailRow('Descriere',
+                  item.description.isEmpty ? '—' : item.description),
+              const SizedBox(height: 10),
+              _detailRow('Creat la', _formatDateTime(item.createdAt)),
+              const SizedBox(height: 10),
+              _detailRow(
+                'Expiră la',
+                item.expiresAt != null
+                    ? _formatDateTime(item.expiresAt!)
+                    : 'Nesetată',
+                valueColor: _isExpired(item) ? Colors.red.shade700 : null,
+              ),
+              if (item.warningAt != null) ...[
+                const SizedBox(height: 10),
+                _detailRow('Alertă la', _formatDateTime(item.warningAt!),
+                    valueColor: Colors.orange.shade700),
+              ],
+              if (item.phones.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                _detailRow('SMS la', item.phones.join('\n'),
+                    valueColor: Colors.blue.shade700),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _showItemDialog(existing: item);
+            },
+            child: const Text('Editează'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Închide'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Widget helpers ───────────────────────────────────────────────────────────
+  Widget _detailRow(String label, String value, {Color? valueColor}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        const SizedBox(height: 2),
+        Text(value,
+            style: TextStyle(fontSize: 14, color: valueColor ?? Colors.black87)),
+      ],
+    );
+  }
+
+  Widget _buildDatePickerRow({
+    required String label,
+    required bool hasValue,
+    required VoidCallback onClear,
+    required Future<void> Function() onPick,
+    IconData icon = Icons.calendar_today,
+  }) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(label,
+              style: TextStyle(
+                  color: hasValue ? Colors.black87 : Colors.grey)),
+        ),
+        if (hasValue)
+          IconButton(
+              icon: const Icon(Icons.clear, size: 18),
+              tooltip: 'Șterge data',
+              onPressed: onClear),
+        TextButton.icon(
+          icon: Icon(icon),
+          label: const Text('Alege'),
+          onPressed: onPick,
+        ),
+      ],
+    );
+  }
+
+  Widget _dataCell(String text,
+      {double? width, bool expired = false, bool muted = false}) {
+    return Container(
+      width: width,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 13,
+          color: expired
+              ? Colors.red.shade700
+              : muted
+                  ? Colors.grey.shade400
+                  : Colors.black87,
+          fontWeight: expired ? FontWeight.w500 : FontWeight.normal,
+          fontStyle: muted ? FontStyle.italic : FontStyle.normal,
+        ),
+        overflow: TextOverflow.ellipsis,
+        maxLines: 1,
+      ),
+    );
+  }
+
+  Widget _freeSlotRow(_FreeSlot slot, bool isEven) {
+    final bg = isEven ? const Color(0xFFF0FDF4) : const Color(0xFFECFDF5);
+    final fg = Colors.green.shade700;
+    return Container(
+      color: bg,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 70 + 160 + 200,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+              child: Text(
+                'Liber',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontStyle: FontStyle.italic,
+                  fontWeight: FontWeight.w600,
+                  color: fg,
+                ),
+              ),
+            ),
+          ),
+          _dataCell(_formatDateTime(slot.start), width: 155, muted: true),
+          _dataCell(_formatDateTime(slot.end),   width: 155, muted: true),
+          const SizedBox(width: 148),
+        ],
+      ),
+    );
+  }
+
+  Widget _actionBtn({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onPressed,
+    Color? color,
+  }) {
+    return IconButton(
+      icon: Icon(icon, size: 18, color: color),
+      tooltip: tooltip,
+      onPressed: onPressed,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 44, minHeight: 44),
+    );
+  }
+
+  // ── Build ────────────────────────────────────────────────────────────────────
+  @override
+  Widget build(BuildContext context) {
+    final rows = _filteredAndSorted;
+    final rowsForDisplay = _spatiereActiva
+        ? (List.of(rows)..sort((a, b) => _compareItems(a, b, SortColumn.expiresAt)))
+        : rows;
+    final displayRows = _withFreeSlots(rowsForDisplay);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: InkWell(
+          onTap: _showBoardMenu,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Organizator',
+                  style: TextStyle(fontSize: 12, color: Colors.white70)),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(_activeBoard.name,
+                      style: const TextStyle(
+                          fontSize: 18, fontWeight: FontWeight.bold)),
+                  const Icon(Icons.arrow_drop_down, color: Colors.white70),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          // Indicator licență (Android)
+          if (Platform.isAndroid)
+            IconButton(
+              icon: Icon(
+                LicenseService.isLicensed
+                    ? Icons.verified_user
+                    : LicenseService.isTrialActive
+                        ? Icons.lock_open_outlined
+                        : Icons.lock_outline,
+                color: LicenseService.isLicensed
+                    ? Colors.greenAccent.shade100
+                    : LicenseService.isTrialActive
+                        ? Colors.orangeAccent.shade100
+                        : Colors.white54,
+              ),
+              tooltip: LicenseService.isLicensed
+                  ? 'Licență activă'
+                  : LicenseService.isTrialActive
+                      ? 'Trial activ · ${LicenseService.trialDaysLeft} zile rămase'
+                      : 'Trial expirat · activează licența',
+              onPressed: LicenseService.isLicensed
+                  ? null
+                  : _showLicenseRequiredDialog,
+            ),
+          // Buton sincronizare — vizibil doar pe Android
+          if (SyncService.isSupported)
+            IconButton(
+              icon: Icon(
+                SyncService.isActive ? Icons.sync : Icons.sync_disabled,
+                color: SyncService.isActive
+                    ? Colors.greenAccent.shade100
+                    : Colors.white54,
+              ),
+              tooltip: SyncService.isActive
+                  ? 'Sincronizare activă · ${SyncService.partnerPhone}'
+                  : 'Configurează sincronizare',
+              onPressed: _showSyncDialog,
+            ),
+          // Buton rezervări prin SMS — vizibil doar pe Android
+          if (Platform.isAndroid)
+            IconButton(
+              icon: Icon(
+                Icons.event_available,
+                color: _bookingSettings.enabled
+                    ? Colors.greenAccent.shade100
+                    : Colors.white54,
+              ),
+              tooltip: _bookingSettings.enabled
+                  ? 'Rezervări prin SMS active'
+                  : 'Configurează rezervări prin SMS',
+              onPressed: _showBookingSettingsDialog,
+            ),
+          IconButton(
+            icon: Icon(
+              _searchVisible ? Icons.search_off : Icons.search,
+              color: Colors.white,
+            ),
+            tooltip: _searchVisible ? 'Ascunde căutare' : 'Caută',
+            onPressed: () {
+              setState(() {
+                _searchVisible = !_searchVisible;
+                if (!_searchVisible) {
+                  _searchController.clear();
+                  _searchQuery = '';
+                }
+              });
+            },
+          ),
+          const SizedBox(width: 4),
+        ],
+      ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  AnimatedSize(
+                    duration: const Duration(milliseconds: 220),
+                    curve: Curves.easeInOut,
+                    child: _searchVisible
+                        ? Padding(
+                            padding: const EdgeInsets.only(bottom: 16),
+                            child: TextField(
+                              controller: _searchController,
+                              autofocus: true,
+                              decoration: InputDecoration(
+                                hintText: 'Caută în tabel...',
+                                prefixIcon: const Icon(Icons.search),
+                                suffixIcon: _searchQuery.isNotEmpty
+                                    ? IconButton(
+                                        icon: const Icon(Icons.clear),
+                                        onPressed: () {
+                                          _searchController.clear();
+                                          setState(() => _searchQuery = '');
+                                        },
+                                      )
+                                    : null,
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                  borderSide: const BorderSide(
+                                      color: Color(0xFFCBD5E1)),
+                                ),
+                                enabledBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                  borderSide: const BorderSide(
+                                      color: Color(0xFFCBD5E1)),
+                                ),
+                                filled: true,
+                                fillColor: Colors.white,
+                              ),
+                              onChanged: (v) =>
+                                  setState(() => _searchQuery = v),
+                            ),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                  Expanded(
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        border:
+                            Border.all(color: const Color(0xFFCBD5E1)),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.07),
+                            blurRadius: 12,
+                            offset: const Offset(0, 3),
+                          ),
+                        ],
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: Column(
+                        children: [
+                          Expanded(
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: SizedBox(
+                                width: 888,
+                                child: Column(
+                                  children: [
+                                    Container(
+                                      color: const Color(0xFF1E1B4B),
+                                      child: Row(
+                                        children: [
+                                          _buildHeaderCell('Nr.',       SortColumn.number,      width: 70),
+                                          _buildHeaderCell('Nume',      SortColumn.name,        width: 160),
+                                          _buildHeaderCell('Descriere', SortColumn.description, width: 200),
+                                          _buildHeaderCell('Creat la',  SortColumn.createdAt,   width: 155),
+                                          _buildHeaderCell('Expiră la', SortColumn.expiresAt,   width: 155),
+                                          const SizedBox(width: 148),
+                                        ],
+                                      ),
+                                    ),
+                                    Expanded(
+                                      child: rows.isEmpty
+                                          ? Center(
+                                              child: Text(
+                                                _searchQuery.isEmpty
+                                                    ? 'Nu există înregistrări.'
+                                                    : 'Niciun rezultat pentru "$_searchQuery".',
+                                                style: TextStyle(
+                                                    color: Colors.grey.shade600),
+                                              ),
+                                            )
+                                          : ListView.builder(
+                                              itemCount: displayRows.length,
+                                              itemBuilder: (ctx, index) {
+                                                final entry  = displayRows[index];
+                                                final isEven = index % 2 == 0;
+                                                if (entry is _FreeSlot) {
+                                                  return _freeSlotRow(entry, isEven);
+                                                }
+                                                final item   = entry as Item;
+                                                final expired = _isExpired(item);
+                                                return InkWell(
+                                                  onTap: () =>
+                                                      _showItemDetail(item),
+                                                  child: Container(
+                                                    color: _rowBg(item, isEven),
+                                                    child: Row(
+                                                      children: [
+                                                        _dataCell(item.number.toString(), width: 70,  expired: expired),
+                                                        _dataCell(item.name,              width: 160, expired: expired),
+                                                        _dataCell(item.description,       width: 200, expired: expired),
+                                                        _dataCell(_formatDateTime(item.createdAt), width: 155, expired: expired),
+                                                        _dataCell(
+                                                          item.expiresAt != null
+                                                              ? _formatDateTime(item.expiresAt!)
+                                                              : 'Nesetată',
+                                                          width: 155,
+                                                          expired: expired,
+                                                          muted: !expired && item.expiresAt == null,
+                                                        ),
+                                                        SizedBox(
+                                                          width: 148,
+                                                          child: Row(
+                                                            mainAxisAlignment:
+                                                                MainAxisAlignment.center,
+                                                            children: [
+                                                              _actionBtn(
+                                                                icon: Icons.edit_outlined,
+                                                                tooltip: 'Editează',
+                                                                onPressed: () =>
+                                                                    _showItemDialog(existing: item),
+                                                              ),
+                                                              _actionBtn(
+                                                                icon: Icons.alarm_outlined,
+                                                                tooltip: 'Setează alertă & SMS',
+                                                                color: item.warningAt != null
+                                                                    ? Colors.orange.shade700
+                                                                    : item.phoneNumber != null
+                                                                        ? Colors.blue.shade600
+                                                                        : null,
+                                                                onPressed: () =>
+                                                                    _showWarningDialog(item),
+                                                              ),
+                                                              _actionBtn(
+                                                                icon: Icons.delete_outlined,
+                                                                tooltip: 'Șterge',
+                                                                color: Colors.red.shade400,
+                                                                onPressed: () =>
+                                                                    _confirmDelete(item),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                );
+                                              },
+                                            ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 8),
+                            color: const Color(0xFFE2E8F0),
+                            child: Row(
+                              children: [
+                                Text(
+                                  rows.length == _items.length
+                                      ? '${_items.length} înregistrări'
+                                      : '${rows.length} din ${_items.length} înregistrări',
+                                  style: TextStyle(
+                                      color: Colors.grey.shade600,
+                                      fontSize: 12),
+                                ),
+                                if (Platform.isAndroid && !LicenseService.isLicensed) ...[
+                                  const SizedBox(width: 8),
+                                  Icon(
+                                    LicenseService.isTrialActive
+                                        ? Icons.lock_open_outlined
+                                        : Icons.lock_outline,
+                                    size: 12,
+                                    color: LicenseService.isTrialActive
+                                        ? Colors.orange.shade600
+                                        : Colors.red.shade600,
+                                  ),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    LicenseService.isTrialActive
+                                        ? 'Trial · ${LicenseService.trialDaysLeft} zile'
+                                        : 'Trial expirat',
+                                    style: TextStyle(
+                                        color: LicenseService.isTrialActive
+                                            ? Colors.orange.shade700
+                                            : Colors.red.shade700,
+                                        fontSize: 11),
+                                  ),
+                                ],
+                                if (SyncService.isActive) ...[
+                                  const SizedBox(width: 8),
+                                  Icon(Icons.sync,
+                                      size: 12,
+                                      color: Colors.green.shade600),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    'Sincronizat',
+                                    style: TextStyle(
+                                        color: Colors.green.shade600,
+                                        fontSize: 11),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+      bottomNavigationBar: _buildBottomBar(),
+    );
+  }
+
+  Widget _buildBottomBar() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.12),
+            blurRadius: 20,
+            offset: const Offset(0, -4),
+          ),
+        ],
+      ),
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+          child: Row(
+            children: [
+              _bottomBtn(
+                icon: Icons.add_circle_rounded,
+                label: 'Adaugă',
+                onTap: () => _showItemDialog(),
+                primary: true,
+              ),
+              const SizedBox(width: 10),
+              _bottomBtn(
+                icon: Icons.bar_chart_rounded,
+                label: 'Raport',
+                onTap: _showReportDialog,
+              ),
+              const SizedBox(width: 10),
+              _bottomBtn(
+                icon: Icons.edit_note_rounded,
+                label: 'Mesaj SMS',
+                onTap: _showSmsTemplateDialog,
+              ),
+              const SizedBox(width: 10),
+              _bottomBtn(
+                icon: Icons.unfold_more_rounded,
+                label: 'Spatiere',
+                onTap: _toggleSpatiere,
+                primary: _spatiereActiva,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _bottomBtn({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+    bool primary = false,
+  }) {
+    const bg      = Color(0xFF1E1B4B);
+    const bgLight = Color(0xFFF1F5F9);
+    return Expanded(
+      child: Material(
+        color: primary ? bg : bgLight,
+        borderRadius: BorderRadius.circular(14),
+        elevation: primary ? 3 : 0,
+        shadowColor: primary
+            ? const Color(0xFF1E1B4B).withValues(alpha: 0.35)
+            : Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(14),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 11),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 22, color: primary ? Colors.white : bg),
+                const SizedBox(height: 4),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    color: primary ? Colors.white : bg,
+                    letterSpacing: 0.2,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Dialog raport ────────────────────────────────────────────────────────────
+  Future<void> _showReportDialog() async {
+    DateTime? from;
+    DateTime? to;
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDs) => AlertDialog(
+          title: const Text('Generează raport'),
+          content: SizedBox(
+            width: 400,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Selectează perioada de expirare:',
+                      style: TextStyle(fontSize: 13, color: Colors.grey)),
+                  const SizedBox(height: 12),
+                  _buildDatePickerRow(
+                    label: from == null
+                        ? 'De la: nesetat'
+                        : 'De la: ${_formatDateTime(from!)}',
+                    hasValue: from != null,
+                    icon: Icons.calendar_today,
+                    onClear: () => setDs(() => from = null),
+                    onPick: () async {
+                      final d = await showDatePicker(
+                          context: ctx,
+                          initialDate: from ?? DateTime.now(),
+                          firstDate: DateTime(2020),
+                          lastDate: DateTime(2100));
+                      if (d == null) return;
+                      setDs(() => from = DateTime(d.year, d.month, d.day));
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  _buildDatePickerRow(
+                    label: to == null
+                        ? 'Până la: nesetat'
+                        : 'Până la: ${_formatDateTime(to!)}',
+                    hasValue: to != null,
+                    icon: Icons.calendar_today,
+                    onClear: () => setDs(() => to = null),
+                    onPick: () async {
+                      final d = await showDatePicker(
+                          context: ctx,
+                          initialDate: to ?? DateTime.now(),
+                          firstDate: DateTime(2020),
+                          lastDate: DateTime(2100));
+                      if (d == null) return;
+                      setDs(() => to =
+                          DateTime(d.year, d.month, d.day, 23, 59, 59));
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Anulează'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _showReportResult(from, to);
+              },
+              child: const Text('Generează'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showReportResult(DateTime? from, DateTime? to) {
+    bool matchPeriod(DateTime? expiresAt) {
+      // Fără filtru de perioadă → toate înregistrările, inclusiv cele
+      // fără dată de expirare setată.
+      if (from == null && to == null) return true;
+      if (expiresAt == null) return false;
+      if (from != null && expiresAt.isBefore(from)) return false;
+      if (to   != null && expiresAt.isAfter(to))   return false;
+      return true;
+    }
+
+    final activeItems = _items
+        .where((i) => matchPeriod(i.expiresAt))
+        .map<ReportEntry>((i) => (item: i, deletedAt: null))
+        .toList();
+
+    final deletedItems = _deletedBuffer
+        .where((d) => matchPeriod(d.item.expiresAt))
+        .map<ReportEntry>((d) => (item: d.item, deletedAt: d.deletedAt))
+        .toList();
+
+    String buildExportText(
+        List<ReportEntry> all, String period, int actCnt, int delCnt) {
+      final buf = StringBuffer();
+      buf.writeln('═══════════════════════════════════════');
+      buf.writeln('         RAPORT ORGANIZATOR');
+      buf.writeln('═══════════════════════════════════════');
+      buf.writeln('Perioadă : $period');
+      buf.writeln('Total    : ${all.length} înregistrări');
+      buf.writeln('  Active : $actCnt');
+      buf.writeln('  Șterse : $delCnt');
+      buf.writeln('───────────────────────────────────────');
+      for (final e in all) {
+        buf.writeln('');
+        final del = e.deletedAt != null ? ' [ȘTERS]' : '';
+        buf.writeln('• ${e.item.name}$del');
+        buf.writeln('  Expiră  : ${e.item.expiresAt != null ? _formatDateTime(e.item.expiresAt!) : "nesetată"}');
+        if (e.deletedAt != null) {
+          buf.writeln('  Șters la: ${_formatDateTime(e.deletedAt!)}');
+        }
+        if (e.item.description.isNotEmpty) {
+          buf.writeln('  Descriere: ${e.item.description}');
+        }
+      }
+      buf.writeln('');
+      buf.writeln('═══════════════════════════════════════');
+      buf.writeln('Generat la: ${_formatDateTime(DateTime.now())}');
+      return buf.toString();
+    }
+
+    final all = <ReportEntry>[...activeItems, ...deletedItems]
+      ..sort((a, b) {
+        final ea = a.item.expiresAt;
+        final eb = b.item.expiresAt;
+        if (ea == null && eb == null) return 0;
+        if (ea == null) return 1;
+        if (eb == null) return -1;
+        return ea.compareTo(eb);
+      });
+
+    final period = (from != null || to != null)
+        ? '${from != null ? _formatDateTime(from) : "—"}  →  ${to != null ? _formatDateTime(to) : "—"}'
+        : 'Toate înregistrările';
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Raport programări'),
+        content: SizedBox(
+          width: 480,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Perioadă: $period',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              const SizedBox(height: 2),
+              RichText(
+                text: TextSpan(
+                  style: const TextStyle(fontSize: 12, color: Colors.black87),
+                  children: [
+                    TextSpan(
+                        text: '${all.length} total  ',
+                        style:
+                            const TextStyle(fontWeight: FontWeight.w600)),
+                    TextSpan(
+                        text: '(${activeItems.length} active',
+                        style: const TextStyle(color: Colors.green)),
+                    const TextSpan(text: '  +  '),
+                    TextSpan(
+                        text:
+                            '${deletedItems.length} șterse din buffer)',
+                        style:
+                            TextStyle(color: Colors.red.shade700)),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (all.isEmpty)
+                const Text('Nu există înregistrări în această perioadă.')
+              else
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 400),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: all.length,
+                    separatorBuilder: (a, b) =>
+                        const Divider(height: 1),
+                    itemBuilder: (_, i) {
+                      final entry     = all[i];
+                      final item      = entry.item;
+                      final isDeleted = entry.deletedAt != null;
+                      final exp       = _isExpired(item);
+
+                      return Padding(
+                        padding:
+                            const EdgeInsets.symmetric(vertical: 8),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 8, height: 8,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: isDeleted
+                                    ? Colors.grey
+                                    : exp
+                                        ? Colors.red
+                                        : Colors.green,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment:
+                                    CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          item.name,
+                                          style: TextStyle(
+                                            fontWeight: FontWeight.w600,
+                                            fontSize: 13,
+                                            color: isDeleted
+                                                ? Colors.grey
+                                                : Colors.black87,
+                                            decoration: isDeleted
+                                                ? TextDecoration.lineThrough
+                                                : null,
+                                          ),
+                                        ),
+                                      ),
+                                      if (isDeleted)
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                              horizontal: 6, vertical: 1),
+                                          decoration: BoxDecoration(
+                                            color: Colors.grey.shade200,
+                                            borderRadius:
+                                                BorderRadius.circular(4),
+                                          ),
+                                          child: Text(
+                                            'ȘTERS',
+                                            style: TextStyle(
+                                                fontSize: 10,
+                                                color: Colors.grey.shade600,
+                                                fontWeight:
+                                                    FontWeight.w600),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                  Text(
+                                    item.expiresAt != null
+                                        ? 'Expiră: ${_formatDateTime(item.expiresAt!)}'
+                                        : 'Fără dată de expirare',
+                                    style: TextStyle(
+                                        fontSize: 12,
+                                        color: isDeleted
+                                            ? Colors.grey
+                                            : exp
+                                                ? Colors.red.shade700
+                                                : Colors.grey.shade600),
+                                  ),
+                                  if (isDeleted)
+                                    Text(
+                                      'Șters la: ${_formatDateTime(entry.deletedAt!)}',
+                                      style: TextStyle(
+                                          fontSize: 11,
+                                          color: Colors.grey.shade500),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton.icon(
+            icon: const Icon(Icons.share_outlined, size: 18),
+            label: const Text('Share'),
+            onPressed: () {
+              final text = buildExportText(
+                  all, period, activeItems.length, deletedItems.length);
+              Share.share(text, subject: 'Raport Organizator');
+            },
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Închide'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Dialog editare template SMS ───────────────────────────────────────────────
+  Future<void> _showSmsTemplateDialog() async {
+    final ctrl = TextEditingController(text: _smsTemplate);
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Editează mesaj SMS'),
+        content: SizedBox(
+          width: 400,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Variabile disponibile:',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w600, fontSize: 13),
+                ),
+                const SizedBox(height: 4),
+                _templateChip('[NUME]',          'Numele înregistrării'),
+                _templateChip('[DATA_EXPIRARE]', 'Data și ora expirării'),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: ctrl,
+                  maxLines: 5,
+                  decoration: const InputDecoration(
+                    labelText: 'Template mesaj',
+                    border: OutlineInputBorder(),
+                    helperText:
+                        'La trimitere, variabilele sunt înlocuite automat.',
+                    helperMaxLines: 2,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextButton.icon(
+                  icon: const Icon(Icons.restart_alt, size: 16),
+                  label: const Text('Resetează la implicit'),
+                  onPressed: () => ctrl.text = _kDefaultSmsTemplate,
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Anulează'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              final tmpl = ctrl.text.trim();
+              if (tmpl.isEmpty) return;
+              setState(() => _smsTemplate = tmpl);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString(_kSmsTemplateKey, tmpl);
+              if (!ctx.mounted) return;
+              Navigator.pop(ctx);
+              for (final item in _items) {
+                if (item.phoneNumber != null &&
+                    item.phoneNumber!.isNotEmpty) {
+                  await SmsService.scheduleFor(item,
+                      template: tmpl, boardIndex: _activeBoardIndex);
+                }
+              }
+            },
+            child: const Text('Salvează'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _phoneField(
+      TextEditingController ctrl, String label, StateSetter setDs) {
+    return TextField(
+      controller: ctrl,
+      keyboardType: TextInputType.phone,
+      onChanged: (_) => setDs(() {}),
+      decoration: InputDecoration(
+        labelText: label,
+        hintText: '+40712345678',
+        border: const OutlineInputBorder(),
+        prefixIcon: const Icon(Icons.phone_outlined, size: 18),
+        isDense: true,
+      ),
+    );
+  }
+
+  Widget _templateChip(String tag, String desc) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          Container(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+              color: const Color(0xFFEEF2FF),
+              borderRadius: BorderRadius.circular(4),
+              border: Border.all(color: const Color(0xFFC7D2FE)),
+            ),
+            child: Text(tag,
+                style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    color: Color(0xFF3730A3))),
+          ),
+          const SizedBox(width: 8),
+          Text(desc,
+              style: const TextStyle(fontSize: 12, color: Colors.grey)),
+        ],
+      ),
+    );
+  }
+}

@@ -1,0 +1,146 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:management_app/main.dart';
+
+void main() {
+  setUpAll(() async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    try { await NotificationService.init(); } catch (_) {}
+  });
+
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
+
+  testWidgets('afișează spinner la pornire apoi tabelul', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+
+    await tester.pumpAndSettle();
+
+    expect(find.text('Organizator'), findsOneWidget);
+    expect(find.text('Nr.'), findsOneWidget);
+    expect(find.text('Nume'), findsOneWidget);
+    expect(find.text('Descriere'), findsOneWidget);
+  });
+
+  testWidgets('datele demo apar la prima lansare', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('Proiect Alpha'), findsOneWidget);
+    expect(find.text('Raport lunar'), findsOneWidget);
+    expect(find.text('5 înregistrări'), findsOneWidget);
+  });
+
+  testWidgets('butonul Adaugă deschide dialogul', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+
+    // Butonul din AppBar are icon Icons.add
+    await tester.tap(find.byIcon(Icons.add_circle_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Adaugă înregistrare'), findsOneWidget);
+    expect(find.widgetWithText(TextField, 'Nume *'), findsOneWidget);
+  });
+
+  testWidgets('adăugarea unui item îl include în tabel', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byIcon(Icons.add_circle_rounded));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.widgetWithText(TextField, 'Nume *'), 'Test Item');
+    // 'Adaugă' apare în AppBar și în dialog; .last = butonul din dialog
+    await tester.tap(find.text('Adaugă').last);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Test Item'), findsOneWidget);
+    expect(find.text('6 înregistrări'), findsOneWidget);
+  });
+
+  testWidgets('căutarea filtrează rândurile', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+
+    // Search-ul este ascuns implicit — activăm cu butonul search
+    await tester.tap(find.byIcon(Icons.search));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField).first, 'Alpha');
+    await tester.pumpAndSettle();
+
+    expect(find.text('Proiect Alpha'), findsOneWidget);
+    expect(find.text('Raport lunar'), findsNothing);
+    expect(find.textContaining('1 din 5'), findsOneWidget);
+  });
+
+  testWidgets('ștergerea unui item îl elimină din tabel', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+
+    // Butonul de delete poate fi în afara viewport-ului orizontal;
+    // scrollăm tabelul la dreapta ca să-l facem vizibil
+    await tester.ensureVisible(find.byIcon(Icons.delete_outlined).first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.delete_outlined).first);
+    await tester.pumpAndSettle();
+
+    // Confirmă ștergerea
+    await tester.tap(find.text('Șterge').last);
+    await tester.pumpAndSettle();
+
+    expect(find.text('4 înregistrări'), findsOneWidget);
+  });
+
+  testWidgets('cele 3 tabele pot fi comutate și sunt independente',
+      (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+
+    // Tabelul activ implicit e „Tabel 1”, cu datele demo.
+    expect(find.text('Tabel 1'), findsOneWidget);
+    expect(find.text('5 înregistrări'), findsOneWidget);
+
+    // Deschidem selectorul de tabele din AppBar.
+    await tester.tap(find.text('Tabel 1'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Tabele'), findsOneWidget);
+    expect(find.text('Tabel 2'), findsOneWidget);
+    expect(find.text('Tabel 3'), findsOneWidget);
+
+    // Comutăm pe „Tabel 2” — trebuie să fie complet gol, independent de Tabel 1.
+    await tester.tap(find.text('Tabel 2'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Tabel 2'), findsOneWidget);
+    expect(find.text('Proiect Alpha'), findsNothing);
+    expect(find.text('0 înregistrări'), findsOneWidget);
+  });
+
+  testWidgets('redenumirea unui tabel actualizează selectorul', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Tabel 1'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Redenumește').first);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Redenumește tabelul'), findsOneWidget);
+    await tester.enterText(
+        find.widgetWithText(TextField, 'Nume tabel'), 'Familie');
+    await tester.tap(find.text('Salvează'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Familie'), findsOneWidget);
+    expect(find.text('Tabel 1'), findsNothing);
+  });
+}
