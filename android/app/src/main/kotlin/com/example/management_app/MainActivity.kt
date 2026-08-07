@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.telephony.SmsManager
 import android.util.Base64
+import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
@@ -485,7 +486,8 @@ class MainActivity : FlutterActivity() {
                 arr.put(o)
             }
             arr.toString()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e("OrgDiag", "computeFreeSlotsJson failed for boardId=$boardId", e)
             "[]"
         }
     }
@@ -505,7 +507,10 @@ class MainActivity : FlutterActivity() {
             } else {
                 smsManager?.sendTextMessage(phone, null, message, null, null)
             }
-        } catch (_: Exception) {}
+            Log.i("OrgDiag", "sendSmsNow OK to=$phone len=${message.length}")
+        } catch (e: Exception) {
+            Log.e("OrgDiag", "sendSmsNow FAILED to=$phone", e)
+        }
     }
 
     // ── AlarmManager pentru SMS programate ───────────────────────────────────────

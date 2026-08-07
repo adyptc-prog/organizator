@@ -264,6 +264,7 @@ class SmsService {
           }) ??
           '[]';
       final decoded = jsonDecode(raw) as List<dynamic>;
+      debugPrint('OrgDiag: _computeFreeSlots boardId=$boardId rawLen=${raw.length} count=${decoded.length}');
       return decoded.map((e) {
         final m = e as Map<String, dynamic>;
         return _FreeSlot(
@@ -271,7 +272,8 @@ class SmsService {
           DateTime.fromMillisecondsSinceEpoch(m['e'] as int),
         );
       }).toList();
-    } catch (_) {
+    } catch (e, st) {
+      debugPrint('OrgDiag: _computeFreeSlots FAILED boardId=$boardId error=$e\n$st');
       return [];
     }
   }
@@ -845,6 +847,7 @@ class _ManagementPageState extends State<ManagementPage>
   final List<Item>        _items         = [];
   final List<DeletedItem> _deletedBuffer = [];
   Timer? _colorTimer;
+  Timer? _syncQueueTimer;
   String _smsTemplate = _kDefaultSmsTemplate;
 
   // Înainte ca _loadData să termine încărcarea inițială, _boards e încă gol
@@ -864,6 +867,7 @@ class _ManagementPageState extends State<ManagementPage>
       SmsService.requestPermission();
     });
     _startColorTimer();
+    _startSyncQueueTimer();
   }
 
   Future<void> _loadData() async {
@@ -991,11 +995,26 @@ class _ManagementPageState extends State<ManagementPage>
     });
   }
 
+  // Rezervările confirmate prin SMS (vezi ClientBookingReceiver, partea nativă)
+  // ajung într-o coadă de sincronizare pe care Flutter o citește normal doar
+  // la reluarea aplicației din fundal (didChangeAppLifecycleState). Dacă
+  // aplicația stă deschisă în prim-plan tot timpul (cazul obișnuit pentru un
+  // ecran de recepție), acel eveniment nu se mai declanșează și rezervarea nu
+  // apărea niciodată automat în tabel — de-aici acest timer, care verifică
+  // periodic coada indiferent dacă aplicația a fost sau nu în fundal.
+  void _startSyncQueueTimer() {
+    _syncQueueTimer?.cancel();
+    _syncQueueTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+      _processSyncQueue();
+    });
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     switch (state) {
       case AppLifecycleState.resumed:
         _startColorTimer();
+        _startSyncQueueTimer();
         _processSyncQueue();
         _checkPendingLicense();
         if (mounted) setState(() {});
@@ -1005,6 +1024,8 @@ class _ManagementPageState extends State<ManagementPage>
       case AppLifecycleState.hidden:
         _colorTimer?.cancel();
         _colorTimer = null;
+        _syncQueueTimer?.cancel();
+        _syncQueueTimer = null;
     }
   }
 
@@ -1012,6 +1033,7 @@ class _ManagementPageState extends State<ManagementPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _colorTimer?.cancel();
+    _syncQueueTimer?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -1654,6 +1676,9 @@ class _ManagementPageState extends State<ManagementPage>
     final slots = Platform.isAndroid
         ? await SmsService._computeFreeSlots(_activeBoardId)
         : _computeFreeSlotsLocal();
+    debugPrint('OrgDiag: _recomputeFreeSlots activeBoardId=$_activeBoardId '
+        'interval=$_spatiereInterval durationMin=${_bookingSettings.durationMin} '
+        'resultCount=${slots.length}');
     if (!mounted) return;
     setState(() => _cachedFreeSlots = slots);
   }

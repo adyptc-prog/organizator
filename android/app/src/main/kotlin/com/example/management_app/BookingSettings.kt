@@ -1,6 +1,7 @@
 package com.example.management_app
 
 import android.content.Context
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDateTime
@@ -32,6 +33,14 @@ object BookingSettings {
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    // Citește un întreg indiferent dacă plugin-ul Flutter shared_preferences l-a
+    // scris ca Int sau ca Long — versiuni diferite ale plugin-ului (mai ales cele
+    // bazate pe noul backend Pigeon) scriu valorile int din Dart cu putLong(),
+    // iar SharedPreferences.getInt() aruncă ClassCastException dacă tipul stocat
+    // nu se potrivește exact. Number acoperă ambele cazuri fără să ghicim tipul.
+    private fun getIntCompat(p: android.content.SharedPreferences, key: String, default: Int): Int =
+        (p.all[key] as? Number)?.toInt() ?: default
+
     fun loadBoards(context: Context): List<BoardInfo> {
         val json = prefs(context).getString("flutter.management_boards", null) ?: return emptyList()
         return try {
@@ -50,13 +59,15 @@ object BookingSettings {
         val p = prefs(context)
         val closedStr = p.getString("flutter.closed_days_$boardId", "") ?: ""
         val closed = closedStr.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet()
-        return BoardBookingSettings(
+        val result = BoardBookingSettings(
             enabled = p.getBoolean("flutter.booking_enabled_$boardId", false),
-            durationMin = p.getInt("flutter.appointment_duration_$boardId", 30),
-            workStartMin = p.getInt("flutter.work_start_$boardId", 9 * 60),
-            workEndMin = p.getInt("flutter.work_end_$boardId", 18 * 60),
+            durationMin = getIntCompat(p, "flutter.appointment_duration_$boardId", 30),
+            workStartMin = getIntCompat(p, "flutter.work_start_$boardId", 9 * 60),
+            workEndMin = getIntCompat(p, "flutter.work_end_$boardId", 18 * 60),
             closedDays = closed,
         )
+        Log.i("OrgDiag", "loadSettings: boardId=$boardId -> $result")
+        return result
     }
 
     private fun parseFlexibleIso(raw: String): LocalDateTime? = try {
@@ -77,18 +88,24 @@ object BookingSettings {
         val result = mutableListOf<BusyInterval>()
 
         val itemsJson = p.getString("flutter.management_items_$boardId", null)
+        Log.i("OrgDiag", "loadBusyIntervals: key=flutter.management_items_$boardId present=${itemsJson != null} len=${itemsJson?.length}")
         if (itemsJson != null) {
             try {
                 val arr = JSONArray(itemsJson)
+                var skippedNoExpiry = 0
+                var skippedBadDate = 0
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    if (o.isNull("expiresAt")) continue
+                    if (o.isNull("expiresAt")) { skippedNoExpiry++; continue }
                     val expiresStr = o.optString("expiresAt", "")
-                    if (expiresStr.isEmpty()) continue
-                    val end = parseFlexibleIso(expiresStr) ?: continue
+                    if (expiresStr.isEmpty()) { skippedNoExpiry++; continue }
+                    val end = parseFlexibleIso(expiresStr)
+                    if (end == null) { skippedBadDate++; Log.w("OrgDiag", "loadBusyIntervals: unparsable expiresAt=\"$expiresStr\""); continue }
                     result.add(BusyInterval(end.minusMinutes(durationMin.toLong()), end))
                 }
-            } catch (_: Exception) {
+                Log.i("OrgDiag", "loadBusyIntervals: totalItems=${arr.length()} busyParsed=${result.size} skippedNoExpiry=$skippedNoExpiry skippedBadDate=$skippedBadDate")
+            } catch (e: Exception) {
+                Log.e("OrgDiag", "loadBusyIntervals: JSON parse failed for boardId=$boardId", e)
             }
         }
 

@@ -7,6 +7,7 @@ import android.content.SharedPreferences
 import android.os.Build
 import android.provider.Telephony
 import android.telephony.SmsManager
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.SecureRandom
@@ -57,6 +58,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
     }
 
     override fun onReceive(context: Context, intent: Intent) {
+        Log.i("OrgDiag", "onReceive action=${intent.action}")
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
         val pdus = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
 
@@ -66,6 +68,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
             val body   = sms.messageBody        ?: continue
             bySender.getOrPut(sender) { StringBuilder() }.append(body)
         }
+        Log.i("OrgDiag", "onReceive senders=${bySender.keys}")
         if (bySender.isEmpty()) return
 
         val pending = goAsync()
@@ -75,8 +78,8 @@ class ClientBookingReceiver : BroadcastReceiver() {
                 for ((sender, sb) in bySender) {
                     try {
                         handleMessage(appContext, sender, sb.toString())
-                    } catch (_: Exception) {
-                        // un mesaj individual corupt nu trebuie să blocheze coada
+                    } catch (e: Exception) {
+                        Log.e("OrgDiag", "handleMessage threw for sender=$sender", e)
                     }
                 }
             } finally {
@@ -93,17 +96,29 @@ class ClientBookingReceiver : BroadcastReceiver() {
     }
 
     private fun handleMessage(context: Context, sender: String, rawBody: String) {
-        if (rawBody.startsWith("ORG:")) return // mesaj de sincronizare — gestionat de SmsSyncReceiver
+        Log.i("OrgDiag", "handleMessage sender=$sender rawBody=\"$rawBody\"")
+        if (rawBody.startsWith("ORG:")) {
+            Log.i("OrgDiag", "handleMessage: ignored, looks like sync message (ORG:)")
+            return
+        }
 
         val senderDigits = digitsOnly(sender)
-        if (senderDigits.isEmpty()) return
-        if (isSyncPartner(context, senderDigits)) return // dispozitiv pereche, nu client
+        if (senderDigits.isEmpty()) {
+            Log.w("OrgDiag", "handleMessage: senderDigits empty, aborting")
+            return
+        }
+        if (isSyncPartner(context, senderDigits)) {
+            Log.i("OrgDiag", "handleMessage: sender=$senderDigits matched sync_partner_phone, ignoring")
+            return
+        }
 
         val body = normalize(rawBody)
+        Log.i("OrgDiag", "handleMessage: normalized body=\"$body\"")
         if (body.isEmpty()) return
 
         val liberMatch  = LIBER_RE.find(body)
         val numberMatch = NUMBER_RE.find(body)
+        Log.i("OrgDiag", "handleMessage: liberMatch=${liberMatch != null} numberMatch=${numberMatch != null}")
 
         when {
             liberMatch != null -> {
@@ -112,6 +127,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
             }
             body == "next" -> continueOffer(context, sender, senderDigits)
             numberMatch != null -> confirmOffer(context, sender, senderDigits, numberMatch.groupValues[1].toInt())
+            else -> Log.i("OrgDiag", "handleMessage: no pattern matched, ignoring silently (by design)")
             // orice alt text e ignorat complet — reduce riscul de fals-pozitive
         }
     }
@@ -130,7 +146,10 @@ class ClientBookingReceiver : BroadcastReceiver() {
             if (partnerDigits.isEmpty()) continue
             val minLen = minOf(senderDigits.length, partnerDigits.length)
             if (minLen < 7) continue
-            if (senderDigits.takeLast(minLen) == partnerDigits.takeLast(minLen)) return true
+            if (senderDigits.takeLast(minLen) == partnerDigits.takeLast(minLen)) {
+                Log.i("OrgDiag", "isSyncPartner: MATCH key=$key partnerDigits=$partnerDigits senderDigits=$senderDigits")
+                return true
+            }
         }
         return false
     }
@@ -184,7 +203,11 @@ class ClientBookingReceiver : BroadcastReceiver() {
     // ── Flux „liber” / „liber <tabel>” ──────────────────────────────────────────
     private fun startOffer(context: Context, sender: String, senderDigits: String, token: String?) {
         val boards = BookingSettings.loadBoards(context)
-        if (boards.isEmpty()) return
+        Log.i("OrgDiag", "startOffer: boards=${boards.map { it.id + "/" + it.name }} token=$token")
+        if (boards.isEmpty()) {
+            Log.w("OrgDiag", "startOffer: no boards found, aborting")
+            return
+        }
 
         val board = matchBoard(boards, token)
         if (board == null) {
@@ -194,6 +217,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
         }
 
         val settings = BookingSettings.loadSettings(context, board.id)
+        Log.i("OrgDiag", "startOffer: board=${board.id} settings.enabled=${settings.enabled}")
         if (!settings.enabled) {
             sendSms(context, sender, "Rezervările prin SMS nu sunt active pentru ${board.name}.")
             return
@@ -363,7 +387,9 @@ class ClientBookingReceiver : BroadcastReceiver() {
             } else {
                 smsManager?.sendTextMessage(phone, null, message, null, null)
             }
-        } catch (_: Exception) {
+            Log.i("OrgDiag", "sendSms OK to=$phone")
+        } catch (e: Exception) {
+            Log.e("OrgDiag", "sendSms FAILED to=$phone", e)
         }
     }
 }
