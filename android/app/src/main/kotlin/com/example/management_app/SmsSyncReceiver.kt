@@ -28,6 +28,23 @@ class SmsSyncReceiver : BroadcastReceiver() {
         // Protejează scrierile concurente în coadă — atât acest receiver, cât și
         // ClientBookingReceiver (rezervări de la clienți) pot scrie simultan.
         val QUEUE_LOCK = Any()
+
+        // Scrie un mesaj în coada de sincronizare — folosit de orice cod nativ
+        // care trebuie să adauge/actualizeze/șteargă o înregistrare (bot de
+        // rezervări, expirare automată de validare etc.), fără să dubleze
+        // logica de acces la SharedPreferences în fiecare loc.
+        fun enqueue(context: Context, boardId: String, msg: String) {
+            synchronized(QUEUE_LOCK) {
+                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val existing = prefs.getString(QUEUE_KEY, "[]") ?: "[]"
+                val arr = JSONArray(existing)
+                val entry = JSONObject()
+                entry.put("board", boardId)
+                entry.put("msg", msg)
+                arr.put(entry)
+                prefs.edit().putString(QUEUE_KEY, arr.toString()).apply()
+            }
+        }
     }
 
     // Păstrăm doar cifrele, ca să comparăm numere indiferent de format

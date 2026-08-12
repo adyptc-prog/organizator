@@ -9,15 +9,36 @@ import java.time.format.DateTimeFormatter
 
 data class BoardInfo(val id: String, val name: String)
 
+// „interval” (salon, programări cu durată fixă) vs „zile” (pensiune, sejururi
+// de lungime variabilă pe zile întregi).
+enum class BoardMode { INTERVAL, ZILE }
+
 data class BoardBookingSettings(
     val enabled: Boolean,
     val durationMin: Int,
+    // Mod „interval”: program de lucru. Mod „zile”: ora de check-in/check-out.
     val workStartMin: Int,
     val workEndMin: Int,
+    // Mod „interval”: zile complet închise. Mod „zile”: zile fără check-in.
     val closedDays: Set<Int>, // 1=luni .. 7=duminică, la fel ca DateTime.weekday din Dart
+    val mode: BoardMode,
+    // Cont bancar afișat clientului în SMS-ul „așteaptă validarea plății”
+    // (doar mod „zile”). Gol dacă proprietarul nu l-a completat.
+    val iban: String,
 )
 
 data class BusyInterval(val startMin: LocalDateTime, val endMin: LocalDateTime)
+
+data class BookedItem(
+    val boardId: String,
+    val syncId: String,
+    val name: String,
+    val description: String,
+    val phones: List<String>,
+    val expiresAt: LocalDateTime?,
+    val startsAt: LocalDateTime?,
+    val validated: Boolean,
+)
 
 /**
  * Citește tabelele, setările de rezervare și programările existente direct din
@@ -65,6 +86,9 @@ object BookingSettings {
             workStartMin = getIntCompat(p, "flutter.work_start_$boardId", 9 * 60),
             workEndMin = getIntCompat(p, "flutter.work_end_$boardId", 18 * 60),
             closedDays = closed,
+            mode = if (p.getString("flutter.board_mode_$boardId", "interval") == "zile")
+                BoardMode.ZILE else BoardMode.INTERVAL,
+            iban = p.getString("flutter.iban_$boardId", "") ?: "",
         )
         Log.i("OrgDiag", "loadSettings: boardId=$boardId -> $result")
         return result
@@ -128,6 +152,163 @@ object BookingSettings {
                 if (expiresStr.isEmpty()) continue
                 val end = parseFlexibleIso(expiresStr) ?: continue
                 result.add(BusyInterval(end.minusMinutes(durationMin.toLong()), end))
+            }
+        } catch (_: Exception) {
+        }
+
+        return result
+    }
+
+    // Citește lista completă de înregistrări ale unui tabel (syncId, telefoane,
+    // dată expirare) — folosit de fluxul de anulare prin SMS ca să găsească
+    // programarea unui client după numărul de telefon, indiferent dacă a fost
+    // creată de bot sau adăugată manual din aplicație.
+    //
+    // Include și rezervările din coada de sincronizare încă neprocesate de
+    // Flutter (coada se golește doar când aplicația e deschisă/în prim-plan —
+    // vezi loadBusyIntervals) — altfel un client care trimite „anuleaza” la
+    // câteva minute după ce a rezervat prin SMS, fără să fi fost deschisă
+    // între timp aplicația, primește „nu am găsit nicio programare activă”,
+    // deși rezervarea chiar există (doar că încă n-a ajuns în lista aplicată).
+    fun loadBookedItems(context: Context, boardId: String): List<BookedItem> {
+        // Cheie = syncId, ca o rezervare cu update în coadă (ORG:U:) să
+        // înlocuiască versiunea persistată, nu să apară de două ori.
+        val result = LinkedHashMap<String, BookedItem>()
+
+        val itemsJson = prefs(context).getString("flutter.management_items_$boardId", null)
+        if (itemsJson != null) {
+            try {
+                val arr = JSONArray(itemsJson)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val syncId = o.optString("syncId", "")
+                    if (syncId.isEmpty()) continue
+                    val phones = listOfNotNull(
+                        o.optString("phoneNumber", "").takeIf { it.isNotEmpty() },
+                        o.optString("phoneNumber2", "").takeIf { it.isNotEmpty() },
+                        o.optString("phoneNumber3", "").takeIf { it.isNotEmpty() },
+                    )
+                    if (phones.isEmpty()) continue
+                    val expiresStr = o.optString("expiresAt", "")
+                    val expiresAt = if (o.isNull("expiresAt") || expiresStr.isEmpty()) null else parseFlexibleIso(expiresStr)
+                    val startsStr = o.optString("startsAt", "")
+                    val startsAt = if (o.isNull("startsAt") || startsStr.isEmpty()) null else parseFlexibleIso(startsStr)
+                    result[syncId] = BookedItem(
+                        boardId = boardId,
+                        syncId = syncId,
+                        name = o.optString("name", ""),
+                        description = o.optString("description", ""),
+                        phones = phones,
+                        expiresAt = expiresAt,
+                        startsAt = startsAt,
+                        validated = o.optBoolean("validated", false),
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("OrgDiag", "loadBookedItems: JSON parse failed for boardId=$boardId", e)
+            }
+        }
+
+        val queueJson = context
+            .getSharedPreferences(SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(SmsSyncReceiver.QUEUE_KEY, "[]") ?: "[]"
+        try {
+            val arr = JSONArray(queueJson)
+            for (i in 0 until arr.length()) {
+                val entry = arr.getJSONObject(i)
+                if (entry.optString("board", "") != boardId) continue
+                val msg = entry.optString("msg", "")
+                if (msg.startsWith("ORG:D:")) {
+                    // Ștergere încă neprocesată — nu o oferim la anulare.
+                    result.remove(msg.substring(6).trim())
+                    continue
+                }
+                val prefix = when {
+                    msg.startsWith("ORG:A:") -> "ORG:A:"
+                    msg.startsWith("ORG:I:") -> "ORG:I:"
+                    msg.startsWith("ORG:U:") -> "ORG:U:"
+                    else -> continue
+                }
+                val j = JSONObject(msg.substring(prefix.length))
+                val syncId = j.optString("s", "")
+                if (syncId.isEmpty()) continue
+                val phones = listOfNotNull(
+                    j.optString("p1", "").takeIf { it.isNotEmpty() },
+                    j.optString("p2", "").takeIf { it.isNotEmpty() },
+                    j.optString("p3", "").takeIf { it.isNotEmpty() },
+                )
+                if (phones.isEmpty()) continue
+                val expiresStr = j.optString("e", "")
+                val expiresAt = if (expiresStr.isEmpty()) null else parseFlexibleIso(expiresStr)
+                val startsStr = j.optString("st", "")
+                val startsAt = if (startsStr.isEmpty()) null else parseFlexibleIso(startsStr)
+                result[syncId] = BookedItem(
+                    boardId = boardId,
+                    syncId = syncId,
+                    name = j.optString("n", ""),
+                    description = j.optString("d", ""),
+                    phones = phones,
+                    expiresAt = expiresAt,
+                    startsAt = startsAt,
+                    validated = j.optBoolean("v", false),
+                )
+            }
+        } catch (_: Exception) {
+        }
+
+        return result.values.toList()
+    }
+
+    // Intervalul ocupat al unui sejur (mod „zile”) = [startsAt, expiresAt) —
+    // spre deosebire de modul „interval”, durata nu mai e fixă per tabel (clientul
+    // o alege prin SMS), deci nu se poate deduce dintr-o valoare unică de tabel.
+    // Sejururile fără startsAt (introduse manual, fără câmpul de check-in) sunt
+    // aproximate la 1 noapte înainte de expiresAt, ca să nu fie ignorate din calcul.
+    fun loadZileBusyRanges(context: Context, boardId: String): List<BusyInterval> {
+        val p = prefs(context)
+        val result = mutableListOf<BusyInterval>()
+
+        val itemsJson = p.getString("flutter.management_items_$boardId", null)
+        if (itemsJson != null) {
+            try {
+                val arr = JSONArray(itemsJson)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val expiresStr = o.optString("expiresAt", "")
+                    if (o.isNull("expiresAt") || expiresStr.isEmpty()) continue
+                    val end = parseFlexibleIso(expiresStr) ?: continue
+                    val startsStr = o.optString("startsAt", "")
+                    val start = if (o.isNull("startsAt") || startsStr.isEmpty()) {
+                        end.minusDays(1)
+                    } else {
+                        parseFlexibleIso(startsStr) ?: end.minusDays(1)
+                    }
+                    result.add(BusyInterval(start, end))
+                }
+            } catch (e: Exception) {
+                Log.e("OrgDiag", "loadZileBusyRanges: JSON parse failed for boardId=$boardId", e)
+            }
+        }
+
+        // La fel ca la loadBusyIntervals: și rezervările din coada de sincronizare
+        // neprocesate încă trebuie tratate ca ocupate.
+        val queueJson = context
+            .getSharedPreferences(SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(SmsSyncReceiver.QUEUE_KEY, "[]") ?: "[]"
+        try {
+            val arr = JSONArray(queueJson)
+            for (i in 0 until arr.length()) {
+                val entry = arr.getJSONObject(i)
+                if (entry.optString("board", "") != boardId) continue
+                val msg = entry.optString("msg", "")
+                if (!msg.startsWith("ORG:A:") && !msg.startsWith("ORG:I:") && !msg.startsWith("ORG:U:")) continue
+                val j = JSONObject(msg.substring(6))
+                val expiresStr = j.optString("e", "")
+                if (expiresStr.isEmpty()) continue
+                val end = parseFlexibleIso(expiresStr) ?: continue
+                val startsStr = j.optString("st", "")
+                val start = if (startsStr.isEmpty()) end.minusDays(1) else (parseFlexibleIso(startsStr) ?: end.minusDays(1))
+                result.add(BusyInterval(start, end))
             }
         } catch (_: Exception) {
         }

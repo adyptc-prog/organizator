@@ -81,6 +81,11 @@
             android:exported="false"
             android:name=".NotifAlarmReceiver"/>
 
+        <!-- Verifică la 24h dacă o rezervare (tabel "zile") a fost validată; dacă nu, o anulează -->
+        <receiver
+            android:exported="false"
+            android:name=".ValidationDeadlineReceiver"/>
+
         <!-- Primește SMS-uri de sincronizare de la celălalt dispozitiv -->
         <receiver
             android:name=".SmsSyncReceiver"
