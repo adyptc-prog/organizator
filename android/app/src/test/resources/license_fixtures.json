@@ -1,0 +1,47 @@
+{
+  "publicKeyDerB64": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7dMtrJA0WflbA64wcrPmBEvlmHsokySSfEZRMeji71zoTR+DXDKa1DnmkPgr5heV3Cy/NTU0DvhrmiP2xd1htRmZbuRTh8PxMpkDPFo2946eiB2qAh52Jc/nFTsUdZDwA55BY5toNP2pGliRbJMR04WFulaOvyBH18e03AxZp0k3gl3D91h7nKl7OVdLp7lVRYKq7QVsSraxa4jeQU84lKqPlQgFb1xh08/d8TzjplcdvQBHSebz0JcxHP2VsnZr84YNE09/f6SFMR2j9O82uWb5tBeJirvHmlQ42kx2mWRpyH0A0qjJGeAP5CgCSZfL4IMlODSQ2drbUgHe9HMZ5QIDAQAB",
+  "timed": {
+    "payload": {
+      "licenseId": "3c46fa8e-ef44-4b25-a4e9-2b0ae95dda06",
+      "businessId": "organizator-1700000000000",
+      "stickId": "",
+      "issuedAt": "2026-09-24T15:13:58Z",
+      "isLifetime": false,
+      "validUntil": "2030-01-01T00:00:00Z"
+    },
+    "signature": "DIuRXxnIS19MdgMUDhaw21ggD4HKZJN4rZuf28Yt1UmgtysbZltJ1z9WmfOZMr392NLm1W+GkTfHZkpCSExOYI9UkQhvxvTgTPFGxb6JEllDhUL9RuAGZ32bo9l8gG04fru0ORB1X27z7FHC372snvh8OPTdbwA+aBuanb6fHfFZUcvcPfZ8aOjqeWK9aaLcdcxsvVKwx1bZOUUJrWA0gKRhBymD89Rx3ATmOnxfAE/CcQCT0l7PdAjv98s/kTFwQC053jmnDyth2IeLXAsnd3iyPpoMy1nsI2JGgVvkIGHcaktzEaK1lrbN+rvm/i+Ay64d6jEerINTeQcUZ+s9aA=="
+  },
+  "timedLater": {
+    "payload": {
+      "licenseId": "aac4c6c4-2a36-4e0b-9a4a-8f9785d66f45",
+      "businessId": "organizator-1700000000000",
+      "stickId": "",
+      "issuedAt": "2026-09-24T15:13:58Z",
+      "isLifetime": false,
+      "validUntil": "2031-01-01T00:00:00Z"
+    },
+    "signature": "dZmQMxd9eoMEVRWZdXJs72vfyKboFVJy1WaYZRmans4KmlUA5dNAI53T11sZVviImODcx+YNUbb1IOQDOiPtDBA8lUiEy9LOKV2SDyVX+7qTGIVv/6iDvgcGZF1A2mlGrOsceAdxJSiDzaCOpvRrbVX2OV2w5HulpqZwXN0URZZCZXSM+2Y7mnlUv2ZfAQr2TBJ3hpu1/eftTNxfZN44c/bq7K7ZqqHJmQmuvSs81sqSxYwVm3lSTXhJfx5BradjKSXYf61ExmdkRA+RJW/djOyVmceDjToWZS0K9en+1ojUVwR55JOtm1KGBUAF0lKKMhYvSdfJNxIg5Bl/bFOULg=="
+  },
+  "lifetime": {
+    "payload": {
+      "licenseId": "b3007493-6cae-4f65-9280-a56f0d2a9f7a",
+      "businessId": "organizator-1700000000000",
+      "stickId": "",
+      "issuedAt": "2026-09-24T15:13:58Z",
+      "isLifetime": true,
+      "validUntil": null
+    },
+    "signature": "jVBxRlqEatPURVJ/VIGtJxSXddj8mEY/3MM1+5akJ6uxq/9DHLSOp0NwGwUqCjKWYGzsWADjmclFmmmOsSTo85W99AjqGCdNykyueaHAPaqJmSGe0hNWYXv6hnreJm39eiFiLuObHk20JlFhxbA/E8GwQUqiPAbn6kmDtDfaAenlvGFJKpKrQxmgj/6Mz2kK1+hwsofWzJCSJRnOe8yj7KFIX2cWeP3LSlywsz2NzKo+F4/1JW6IuGb2qeA6GpyxSvhF50A42I7Boc4C4+/7yD8P+qus6IXEQPEh7P28YZ+0d6qjhS+CPswHsKEftzAiQ4ur+KHsMznU5po6f44bjg=="
+  },
+  "otherInstall": {
+    "payload": {
+      "licenseId": "44334532-4318-4a9b-9083-68823fb894de",
+      "businessId": "organizator-1800000000000",
+      "stickId": "",
+      "issuedAt": "2026-09-24T15:13:58Z",
+      "isLifetime": false,
+      "validUntil": "2030-01-01T00:00:00Z"
+    },
+    "signature": "oT9RvLZGCS1V4SdpSL8DrxJLKrgggUm+BhMMjE6MkncnkY8mLaD9bOU1D+w9u+7T7njw1hJROUZasKrUD/XYsUdUlXwJafoUfhbZtgwD8kNb+gw8uKnSCTfUC/xv7yZHBqwDOiQlBLr4tzY3pwb3kA8uFHkLTfnILgJ1pF/UxVUU+Va4RnRBw+/jYqIX0va3Mnhvo36f1Lt8uJFwFAauRnTgHZEKdNUjRGlyMbKrsU+qutNxf4YchPlSKPFJYum61Bgcl5TFpmfOHcuva9sCDs6sNWG7oOFic2ZMxNDPddlpJM3PsloJuWKRD44qJemXaOl+MAlgNgNI1ZptHjby9w=="
+  }
+}

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.provider.Telephony
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -24,6 +25,13 @@ class SmsSyncReceiver : BroadcastReceiver() {
         const val SYNC_PREFIX = "ORG:"
         const val PREFS_NAME  = "SyncQueue"
         const val QUEUE_KEY   = "queue"
+
+        // Licența se împarte între cele două telefoane sincronizate: „L” poartă
+        // fișierul de licență semnat, „R” e cererea unui telefon fără licență
+        // (trimisă când își configurează partenerul după ce celălalt a făcut-o
+        // deja — altfel licența trimisă atunci ar fi fost ignorată).
+        const val LICENSE_PREFIX         = "ORG:L:"
+        const val LICENSE_REQUEST_PREFIX = "ORG:R:"
 
         // Protejează scrierile concurente în coadă — atât acest receiver, cât și
         // ClientBookingReceiver (rezervări de la clienți) pot scrie simultan.
@@ -107,6 +115,24 @@ class SmsSyncReceiver : BroadcastReceiver() {
 
             val boardId = matchingBoardId(flutterPrefs, sender) ?: continue
 
+            if (body.startsWith(LICENSE_PREFIX)) {
+                try {
+                    val decision = LicenseStore.adoptFromPartner(
+                        context, body.removePrefix(LICENSE_PREFIX)
+                    )
+                    Log.i("OrgDiag", "license from partner: $decision")
+                } catch (e: Exception) {
+                    Log.e("OrgDiag", "license from partner FAILED", e)
+                }
+                continue
+            }
+            if (body.startsWith(LICENSE_REQUEST_PREFIX)) {
+                LicenseStore.shareableLicense(context)?.let {
+                    sendSms(context, sender, LICENSE_PREFIX + it)
+                }
+                continue
+            }
+
             try {
                 synchronized(QUEUE_LOCK) {
                     val existing = prefs.getString(QUEUE_KEY, "[]") ?: "[]"
@@ -121,5 +147,9 @@ class SmsSyncReceiver : BroadcastReceiver() {
                 // JSON corupt — ignorat
             }
         }
+    }
+
+    private fun sendSms(context: Context, phone: String, message: String) {
+        SmsSender.send(context, phone, message)
     }
 }

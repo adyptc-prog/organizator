@@ -3,8 +3,6 @@ package com.example.management_app
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
-import android.telephony.SmsManager
 import org.json.JSONObject
 
 class SmsAlarmReceiver : BroadcastReceiver() {
@@ -31,13 +29,9 @@ class SmsAlarmReceiver : BroadcastReceiver() {
 
                 if (phone.isBlank() || message.isBlank()) return@Thread
 
-                val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    context.getSystemService(SmsManager::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    SmsManager.getDefault()
-                }
-                smsManager?.sendTextMessage(phone, null, message, null, null)
+                // Împărțit în segmente: un text cu diacritice peste 70 de
+                // caractere nu pleacă altfel (sendTextMessage eșua silențios).
+                SmsSender.send(context, phone, message)
 
                 // Nu ștergem cheia din SharedPreferences din receiver:
                 // evităm accesul concurent cu Flutter care poate provoca crash

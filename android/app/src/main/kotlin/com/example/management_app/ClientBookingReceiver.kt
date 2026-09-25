@@ -4,9 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.os.Build
 import android.provider.Telephony
-import android.telephony.SmsManager
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -762,22 +760,6 @@ class ClientBookingReceiver : BroadcastReceiver() {
         SmsSyncReceiver.enqueue(context, boardId, msg)
 
     private fun sendSms(context: Context, phone: String, message: String) {
-        try {
-            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                context.getSystemService(SmsManager::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            }
-            val parts = smsManager?.divideMessage(message)
-            if (parts != null && parts.size > 1) {
-                smsManager.sendMultipartTextMessage(phone, null, parts, null, null)
-            } else {
-                smsManager?.sendTextMessage(phone, null, message, null, null)
-            }
-            Log.i("OrgDiag", "sendSms OK to=$phone")
-        } catch (e: Exception) {
-            Log.e("OrgDiag", "sendSms FAILED to=$phone", e)
-        }
+        SmsSender.send(context, phone, message)
     }
 }

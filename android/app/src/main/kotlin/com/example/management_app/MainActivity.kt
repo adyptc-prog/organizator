@@ -1,16 +1,11 @@
 package com.example.management_app
 
-import android.Manifest
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
-import android.telephony.SmsManager
+import android.provider.DocumentsContract
 import android.util.Base64
 import android.util.Log
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -25,19 +20,10 @@ class MainActivity : FlutterActivity() {
     companion object {
         const val SMS_CHANNEL     = "organizator/sms"
         const val LICENSE_CHANNEL = "organizator/license"
-        private const val REQ_RECEIVE_SMS = 1002
-        private const val KEY_LICENSE_URI = "license_uri"
+        const val BACKUP_CHANNEL  = "organizator/backup"
         private const val PICK_LICENSE_REQUEST_CODE = 8021
-
-        // Cheia publică RSA-2048 (DER/X.509, base64) — corespunde tools/private.pem
-        private const val PUBLIC_KEY_B64 =
-            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6LMDi/tUuBHqLag6NHTw" +
-            "WNQfS3Forlq5IVkSDtjoNa/Q+2N+hlfSdLJyNsetsZhBpDhvpl/BBbvlMT+CZsyh" +
-            "xnmVVZ1w0bd6JUftEYAnK6/aaLW7qaRxQ0Gh1LT6YDKpJecd5ozWM7hgNTXoflRl" +
-            "PgjmdxiQJcZHOuRV4crPOYDNPQbgbWnHVMor4MyOX9bLzHOdyVjO/SyDNR2eMoLP" +
-            "TtoHDI1Lhj/2r3T6tt/BE+mC8see5GCq2Jzb31IgFpw0gPAK495R3P3b3URbCCkt" +
-            "yx23dfww5NNWiI4fRp/PyFMS1lvqprQZf8gLWXqnKmmih+2kTNE6ukHcO7pjfKBD" +
-            "UwIDAQAB"
+        private const val PICK_BACKUP_FOLDER_REQUEST_CODE = 8022
+        private const val PICK_RESTORE_BACKUP_REQUEST_CODE = 8023
     }
 
     // Token .orgtoken primit prin intent, așteptând ca Flutter să fie gata
@@ -45,6 +31,12 @@ class MainActivity : FlutterActivity() {
 
     // Fluxul nou de licențiere (businessId + expirare, format identic cu Fidelio)
     private var pendingLicensePickResult: MethodChannel.Result? = null
+
+    // Backup: selectoarele de folder / fișier așteaptă rezultatul activității
+    private var pendingBackupFolderResult: MethodChannel.Result? = null
+    private var pendingBackupDestination: String = "phone"
+    private var pendingRestoreResult: MethodChannel.Result? = null
+    private var pendingRestoreKeepPartners: Boolean = true
 
     // ── Lifecycle ────────────────────────────────────────────────────────────────
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
@@ -60,6 +52,10 @@ class MainActivity : FlutterActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        when (requestCode) {
+            PICK_BACKUP_FOLDER_REQUEST_CODE -> { handleBackupFolderResult(resultCode, data); return }
+            PICK_RESTORE_BACKUP_REQUEST_CODE -> { handleRestoreResult(resultCode, data); return }
+        }
         if (requestCode != PICK_LICENSE_REQUEST_CODE) return
 
         val result = pendingLicensePickResult ?: return
@@ -71,14 +67,10 @@ class MainActivity : FlutterActivity() {
         }
 
         try {
-            val flags = data.flags and
-                (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            contentResolver.takePersistableUriPermission(uri, flags and Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            getSharedPreferences("LicensePrefs", Context.MODE_PRIVATE)
-                .edit()
-                .putString(KEY_LICENSE_URI, uri.toString())
-                .apply()
-            result.success(uri.toString())
+            val content = contentResolver.openInputStream(uri)?.use {
+                it.reader(Charsets.UTF_8).readText()
+            } ?: throw IllegalStateException("Could not read license file.")
+            result.success(LicenseStore.importLicense(this, content).toMap(uri.toString()))
         } catch (error: Exception) {
             result.error("LICENSE_PICK_FAILED", error.message ?: error.toString(), null)
         }
@@ -101,6 +93,36 @@ class MainActivity : FlutterActivity() {
     // ── Flutter Engine ───────────────────────────────────────────────────────────
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        OrganizatorBackupWorker.schedule(applicationContext)
+
+        // ── Canal Backup ──────────────────────────────────────────────────────
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BACKUP_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getStatus" -> runInBackground(result, "BACKUP_STATUS_FAILED") {
+                        BackupManager.status(this)
+                    }
+                    "pickFolder" -> pickBackupFolder(call.argument<String>("destination") ?: "phone", result)
+                    "createBackup" -> runInBackground(result, "BACKUP_CREATE_FAILED") {
+                        BackupManager.createBackup(this, auto = false)
+                    }
+                    "listBackups" -> runInBackground(result, "BACKUP_LIST_FAILED") {
+                        BackupManager.listBackups(this)
+                    }
+                    "restoreBackup" -> {
+                        val id = call.argument<String>("id")
+                            ?: run { result.error("ARG", "missing id", null); return@setMethodCallHandler }
+                        val keep = call.argument<Boolean>("keepSyncPartners") ?: true
+                        runInBackground(result, "BACKUP_RESTORE_FAILED") {
+                            BackupManager.restoreFromDocumentId(this, id, keep); null
+                        }
+                    }
+                    "pickAndRestoreBackup" -> pickAndRestoreBackup(
+                        call.argument<Boolean>("keepSyncPartners") ?: true, result
+                    )
+                    else -> result.notImplemented()
+                }
+            }
 
         // ── Canal SMS (alarme + sincronizare) ─────────────────────────────────
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SMS_CHANNEL)
@@ -166,22 +188,6 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
-                    "requestReceiveSms" -> {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            if (ContextCompat.checkSelfPermission(
-                                    this, Manifest.permission.RECEIVE_SMS
-                                ) != PackageManager.PERMISSION_GRANTED
-                            ) {
-                                ActivityCompat.requestPermissions(
-                                    this,
-                                    arrayOf(Manifest.permission.RECEIVE_SMS),
-                                    REQ_RECEIVE_SMS
-                                )
-                            }
-                        }
-                        result.success(null)
-                    }
-
                     "computeFreeSlots" -> {
                         val boardId = call.argument<String>("boardId")
                             ?: run { result.error("ARG", "missing boardId", null); return@setMethodCallHandler }
@@ -189,6 +195,13 @@ class MainActivity : FlutterActivity() {
                         val maxResults  = call.argument<Int>("maxResults") ?: 200
                         val nights      = call.argument<Int>("nights")
                         result.success(computeFreeSlotsJson(boardId, horizonDays, maxResults, nights))
+                    }
+
+                    "getSmsFailure" -> result.success(SmsStatus.pendingFailure(this))
+
+                    "dismissSmsFailure" -> {
+                        SmsStatus.dismiss(this)
+                        result.success(null)
                     }
 
                     "getSyncMessages" -> {
@@ -235,9 +248,11 @@ class MainActivity : FlutterActivity() {
                     }
 
                     // ── Flux nou: licență cu businessId + expirare, cumpărată de pe site ──
-                    "getBusinessId" -> result.success(getOrCreateBusinessId())
-                    "checkLicense" -> checkLicense(result)
+                    "getBusinessId" -> result.success(LicenseStore.getOrCreateBusinessId(this))
+                    "checkLicense" -> result.success(LicenseStore.check(this).toMap(null))
                     "pickLicenseFile" -> pickLicenseFile(result)
+                    "getShareableLicense" -> result.success(LicenseStore.shareableLicense(this))
+                    "consumePartnerNotice" -> result.success(LicenseStore.consumePartnerNotice(this))
 
                     else -> result.notImplemented()
                 }
@@ -260,7 +275,7 @@ class MainActivity : FlutterActivity() {
             }
 
             // Încarcă cheia publică (SPKI/X.509 DER, base64 concatenat)
-            val keyBytes  = Base64.decode(PUBLIC_KEY_B64.replace("\\s".toRegex(), ""), Base64.DEFAULT)
+            val keyBytes  = Base64.decode(LicenseStore.PUBLIC_KEY_B64, Base64.DEFAULT)
             val publicKey = KeyFactory.getInstance("RSA")
                 .generatePublic(X509EncodedKeySpec(keyBytes))
 
@@ -300,31 +315,7 @@ class MainActivity : FlutterActivity() {
     }
 
     // ── Flux nou de licențiere (identic ca format cu Fidelio) ────────────────────
-    private fun getOrCreateBusinessId(): String {
-        val prefs = getSharedPreferences("LicensePrefs", Context.MODE_PRIVATE)
-        val existing = prefs.getString("business_id", null)
-        if (existing != null) return existing
-        val fresh = "organizator-${System.currentTimeMillis()}"
-        prefs.edit().putString("business_id", fresh).apply()
-        return fresh
-    }
-
-    private data class LicenseSource(val content: String, val path: String)
-
-    private fun readSelectedLicense(): LicenseSource? {
-        val uriText = getSharedPreferences("LicensePrefs", Context.MODE_PRIVATE)
-            .getString(KEY_LICENSE_URI, null) ?: return null
-        return try {
-            val uri = Uri.parse(uriText)
-            val content = contentResolver.openInputStream(uri)?.use { input ->
-                input.reader(Charsets.UTF_8).readText()
-            } ?: return null
-            LicenseSource(content = content, path = uriText)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
+    // Verificarea, stocarea și preluarea de la partener sunt în LicenseStore.
     private fun pickLicenseFile(result: MethodChannel.Result) {
         if (pendingLicensePickResult != null) {
             result.error("LICENSE_PICK_BUSY", "A license picker is already open.", null)
@@ -337,136 +328,88 @@ class MainActivity : FlutterActivity() {
             type = "*/*"
             putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/json", "text/*", "application/octet-stream"))
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }
         startActivityForResult(intent, PICK_LICENSE_REQUEST_CODE)
     }
 
-    // Anti-clock-manipulation: monotonically non-decreasing "effective now",
-    // identical logic to Fidelio's getEffectiveNow().
-    private fun getEffectiveNow(): Long {
-        val prefs = getSharedPreferences("LicensePrefs", Context.MODE_PRIVATE)
-        val lastMs = prefs.getLong("last_license_check", 0L)
-        val deviceNow = System.currentTimeMillis()
-        val effectiveNow = if (deviceNow < lastMs - 60_000L) lastMs else maxOf(deviceNow, lastMs)
-        prefs.edit().putLong("last_license_check", effectiveNow).apply()
-        return effectiveNow
+    // ── Backup ───────────────────────────────────────────────────────────────────
+    // Operațiile pe fișiere (stick USB) nu blochează interfața.
+    private fun runInBackground(result: MethodChannel.Result, errorCode: String, work: () -> Any?) {
+        Thread {
+            try {
+                val value = work()
+                runOnUiThread { result.success(value) }
+            } catch (e: Exception) {
+                runOnUiThread { result.error(errorCode, e.message ?: e.toString(), null) }
+            }
+        }.start()
     }
 
-    private fun parseIso8601Utc(dateStr: String?): Long? {
-        if (dateStr.isNullOrBlank()) return null
-        return try {
-            java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US).apply {
-                timeZone = java.util.TimeZone.getTimeZone("UTC")
-            }.parse(dateStr)?.time
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun licenseResult(status: String, message: String, path: String?): HashMap<String, Any?> {
-        val data = HashMap<String, Any?>()
-        data["status"] = status
-        data["message"] = message
-        data["path"] = path
-        return data
-    }
-
-    // Trebuie să fie identic byte-cu-byte cu canonicalLicensePayload() din
-    // voltacademy_web/lib/licenseSigner.js — nu schimba ordinea câmpurilor.
-    private fun canonicalLicensePayload(payload: JSONObject): String {
-        return listOf(
-            payload.optString("licenseId"),
-            payload.optString("businessId"),
-            payload.optString("stickId"),
-            payload.optString("issuedAt"),
-            payload.optBoolean("isLifetime", false).toString(),
-            if (payload.isNull("validUntil")) "" else payload.optString("validUntil"),
-        ).joinToString("|")
-    }
-
-    private fun verifyLicenseSignature(payload: JSONObject, signatureBase64: String): Boolean {
-        if (signatureBase64.isBlank()) {
-            return false
-        }
-        val canonical = canonicalLicensePayload(payload)
-        val signatureBytes = Base64.decode(signatureBase64, Base64.DEFAULT)
-        val keyBytes = Base64.decode(PUBLIC_KEY_B64.replace("\\s".toRegex(), ""), Base64.DEFAULT)
-        val publicKey = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(keyBytes))
-        val verifier = Signature.getInstance("SHA256withRSA")
-        verifier.initVerify(publicKey)
-        verifier.update(canonical.toByteArray(Charsets.UTF_8))
-        return verifier.verify(signatureBytes)
-    }
-
-    private fun checkLicense(result: MethodChannel.Result) {
-        val businessId = getOrCreateBusinessId()
-        val licenseSource = readSelectedLicense()
-        if (licenseSource == null) {
-            result.success(licenseResult("missing", "No license file selected.", null))
+    private fun pickBackupFolder(destination: String, result: MethodChannel.Result) {
+        if (pendingBackupFolderResult != null) {
+            result.error("BACKUP_PICK_BUSY", "A backup folder picker is already open.", null)
             return
         }
-
-        try {
-            val root = JSONObject(licenseSource.content)
-            val payload = root.getJSONObject("payload")
-            val signature = root.optString("signature")
-            val licenseBusinessId = payload.optString("businessId")
-            val isLifetime = payload.optBoolean("isLifetime", false)
-            val validUntilStr = if (payload.isNull("validUntil")) null
-                                else payload.optString("validUntil").takeIf { it.isNotBlank() }
-            val issuedAtStr = payload.optString("issuedAt")
-
-            if (licenseBusinessId != businessId) {
-                result.success(licenseResult("invalid", "License belongs to another installation.", licenseSource.path))
-                return
+        pendingBackupFolderResult = result
+        pendingBackupDestination = destination
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            // Memoria telefonului: pornim din Documents, unde backup-ul
+            // supraviețuiește dezinstalării aplicației.
+            if (destination == "phone" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                putExtra(
+                    DocumentsContract.EXTRA_INITIAL_URI,
+                    DocumentsContract.buildDocumentUri(
+                        "com.android.externalstorage.documents", "primary:Documents"
+                    )
+                )
             }
+        }
+        startActivityForResult(intent, PICK_BACKUP_FOLDER_REQUEST_CODE)
+    }
 
-            val effectiveNow = getEffectiveNow()
+    private fun handleBackupFolderResult(resultCode: Int, data: Intent?) {
+        val result = pendingBackupFolderResult ?: return
+        pendingBackupFolderResult = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            result.error("BACKUP_PICK_CANCELLED", "No backup folder was selected.", null)
+            return
+        }
+        runInBackground(result, "BACKUP_PICK_FAILED") {
+            BackupManager.setFolder(this, uri, pendingBackupDestination)
+            BackupManager.status(this)
+        }
+    }
 
-            val issuedAtMs = parseIso8601Utc(issuedAtStr)
-            if (issuedAtMs != null && effectiveNow < issuedAtMs) {
-                result.success(licenseResult("invalid", "Device clock is set before the license issue date.", licenseSource.path))
-                return
-            }
+    private fun pickAndRestoreBackup(keepSyncPartners: Boolean, result: MethodChannel.Result) {
+        if (pendingRestoreResult != null) {
+            result.error("RESTORE_PICK_BUSY", "A backup picker is already open.", null)
+            return
+        }
+        pendingRestoreResult = result
+        pendingRestoreKeepPartners = keepSyncPartners
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivityForResult(intent, PICK_RESTORE_BACKUP_REQUEST_CODE)
+    }
 
-            if (!isLifetime) {
-                val validUntilMs = parseIso8601Utc(validUntilStr)
-                if (validUntilMs == null) {
-                    result.success(licenseResult("invalid", "License has no valid expiry date.", licenseSource.path))
-                    return
-                }
-                if (effectiveNow >= validUntilMs) {
-                    result.success(licenseResult("invalid", "License has expired.", licenseSource.path))
-                    return
-                }
-            }
-
-            if (!verifyLicenseSignature(payload, signature)) {
-                result.success(licenseResult("invalid", "License signature is invalid.", licenseSource.path))
-                return
-            }
-
-            val data = HashMap<String, Any?>()
-            data["status"] = "active"
-            data["path"] = licenseSource.path
-            data["licenseId"] = payload.optString("licenseId")
-            data["isLifetime"] = isLifetime
-
-            if (!isLifetime && validUntilStr != null) {
-                val validUntilMs = parseIso8601Utc(validUntilStr)!!
-                val daysRemaining = ((validUntilMs - effectiveNow) / (24L * 60L * 60L * 1000L)).toInt()
-                data["validUntil"] = validUntilStr
-                data["daysUntilExpiry"] = daysRemaining
-                data["message"] = if (daysRemaining <= 1) "License expires tomorrow."
-                                   else "License active. $daysRemaining days remaining."
-            } else {
-                data["message"] = "Lifetime license active."
-            }
-
-            result.success(data)
-        } catch (error: Exception) {
-            result.success(licenseResult("invalid", error.message ?: error.toString(), licenseSource.path))
+    private fun handleRestoreResult(resultCode: Int, data: Intent?) {
+        val result = pendingRestoreResult ?: return
+        pendingRestoreResult = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            result.error("RESTORE_PICK_CANCELLED", "No backup file was selected.", null)
+            return
+        }
+        val keep = pendingRestoreKeepPartners
+        runInBackground(result, "BACKUP_RESTORE_FAILED") {
+            BackupManager.restoreFromUri(this, uri, keep); null
         }
     }
 
@@ -518,23 +461,7 @@ class MainActivity : FlutterActivity() {
 
     // ── SMS imediat (multipart dacă depășește 160 caractere) ─────────────────────
     private fun sendSmsNow(phone: String, message: String) {
-        try {
-            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                getSystemService(SmsManager::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            }
-            val parts = smsManager?.divideMessage(message)
-            if (parts != null && parts.size > 1) {
-                smsManager.sendMultipartTextMessage(phone, null, parts, null, null)
-            } else {
-                smsManager?.sendTextMessage(phone, null, message, null, null)
-            }
-            Log.i("OrgDiag", "sendSmsNow OK to=$phone len=${message.length}")
-        } catch (e: Exception) {
-            Log.e("OrgDiag", "sendSmsNow FAILED to=$phone", e)
-        }
+        SmsSender.send(this, phone, message)
     }
 
     // ── AlarmManager pentru SMS programate ───────────────────────────────────────
