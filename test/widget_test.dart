@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:management_app/main.dart';
@@ -142,5 +143,33 @@ void main() {
 
     expect(find.text('Familie'), findsOneWidget);
     expect(find.text('Tabel 1'), findsNothing);
+  });
+
+  group('versiunea aplicației', () {
+    setUp(() {
+      PackageInfo.setMockInitialValues(
+        appName: 'Organizator',
+        packageName: 'app.sayitapp.organizator',
+        version: '1.5.0',
+        buildNumber: '9',
+        buildSignature: '',
+      );
+    });
+
+    testWidgets('apare sub tabel', (tester) async {
+      await tester.pumpWidget(const ManagementApp());
+      await tester.pumpAndSettle();
+      expect(find.text('v1.5.0'), findsOneWidget);
+    });
+
+    testWidgets('încape pe un telefon îngust (360 px)', (tester) async {
+      tester.view.physicalSize = const Size(360, 740);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(const ManagementApp());
+      await tester.pumpAndSettle();
+      expect(find.text('v1.5.0'), findsOneWidget);
+      expect(tester.takeException(), isNull); // fără RenderFlex overflow
+    });
   });
 }

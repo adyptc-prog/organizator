@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -962,6 +963,7 @@ class _ManagementPageState extends State<ManagementPage>
     WidgetsBinding.instance.addObserver(this);
     _loadData();
     WidgetsBinding.instance.addPostFrameCallback((_) => _requestPermissions());
+    _loadAppVersion();
     _startColorTimer();
     _startSyncQueueTimer();
   }
@@ -974,6 +976,17 @@ class _ManagementPageState extends State<ManagementPage>
     await NotificationService.requestPermissions();
     await _checkSmsPermission();
     await _checkSmsFailure();
+  }
+
+  // Versiunea instalată, afișată sub tabel — utilizatorul o compară cu cea de
+  // pe site ca să știe dacă are o actualizare disponibilă.
+  String _appVersion = '';
+
+  Future<void> _loadAppVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (mounted) setState(() => _appVersion = info.version);
+    } catch (_) {}
   }
 
   // ── Permisiunea SMS ──────────────────────────────────────────────────────────
@@ -3617,6 +3630,20 @@ class _ManagementPageState extends State<ManagementPage>
                                         fontSize: 11),
                                   ),
                                 ],
+                                // Ocupă spațiul rămas, aliniată la dreapta; pe ecrane
+                                // înguste se trunchiază în loc să depășească rândul.
+                                if (_appVersion.isNotEmpty)
+                                  Expanded(
+                                    child: Text(
+                                      'v$_appVersion',
+                                      textAlign: TextAlign.right,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          color: Colors.grey.shade500,
+                                          fontSize: 11),
+                                    ),
+                                  ),
                               ],
                             ),
                           ),
