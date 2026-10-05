@@ -801,6 +801,9 @@ class ClientBookingReceiver : BroadcastReceiver() {
         item.put("c", createdAt.format(ISO_SHORT))
         item.put("e", end.format(ISO_SHORT))
         item.put("p1", sender)
+        // Rezervare făcută de client prin bot: telefonul e al clientului, nu
+        // un destinatar de alerte — fără SMS „EXPIRAT” la final.
+        item.put("b", true)
         if (includeStartsAt) item.put("st", start.format(ISO_SHORT))
 
         enqueueSyncMessage(context, boardId, "ORG:A:$item")

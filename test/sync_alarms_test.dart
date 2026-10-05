@@ -144,4 +144,29 @@ void main() {
     expect(lastSmsOp(320), 'cancel');
     expect(prefs.containsKey('sms_alarm_320'), isFalse);
   });
+
+  testWidgets('rezervarea prin bot nu primește SMS „EXPIRAT”, cea manuală da',
+      (tester) async {
+    String add(String syncId, {bool bot = false}) => 'ORG:A:${jsonEncode({
+          's': syncId,
+          'n': '+40755555555',
+          'c': '2030-01-05T10:00',
+          'e': '2030-01-05T10:30',
+          'p1': '+40755555555',
+          if (bot) 'b': true,
+        })}';
+    queue.add({'id': 'q1', 'board': 'b1', 'msg': add('botb', bot: true)});
+    queue.add({'id': 'q2', 'board': 'b1', 'msg': add('manu')});
+
+    await tester.pumpWidget(const ManagementApp());
+    await settle(tester);
+
+    // Numerele 4 (bot) și 5 (manual): expirare = n*100+20.
+    expect(lastSmsOp(420), isNot('schedule'));
+    expect(lastSmsOp(520), 'schedule');
+    final prefs = await SharedPreferences.getInstance();
+    final items = jsonDecode(prefs.getString('management_items_b1')!) as List;
+    expect(items.firstWhere((i) => i['syncId'] == 'botb')['viaBot'], isTrue);
+  });
 }
+

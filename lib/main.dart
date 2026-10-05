@@ -269,7 +269,7 @@ class SmsService {
             message: buildMsg(template));
       }
     }
-    if (item.expiresAt != null && item.expiresAt!.isAfter(now)) {
+    if (!item.viaBot && item.expiresAt != null && item.expiresAt!.isAfter(now)) {
       final ids = _expIds(item.number, boardIndex);
       for (var i = 0; i < phones.length && i < ids.length; i++) {
         await _schedule(
@@ -420,7 +420,8 @@ class ValidationService {
 //   ORG:Z:        — sfârșitul sincronizării inițiale
 //
 // Câmpuri JSON compact: s=syncId, n=name, d=description, c=createdAt,
-//   e=expiresAt, w=warningAt, p1/p2/p3=phoneNumbers
+//   e=expiresAt, w=warningAt, p1/p2/p3=phoneNumbers, st=startsAt,
+//   v=validated, b=rezervare prin bot (viaBot)
 class SyncService {
   static const _ch = MethodChannel('organizator/sms');
   static String? _partnerPhone;
@@ -640,6 +641,10 @@ class Item {
   // „zile”. Nu afectează ocuparea sloturilor (o programare nevalidată rămâne
   // blocată la fel ca una validată).
   final bool validated;
+  // Rezervare făcută de client prin botul SMS. Telefonul ei e al clientului
+  // (pentru anulare/confirmări), nu un destinatar de alerte: la expirare nu
+  // primește SMS-ul „EXPIRAT”.
+  final bool viaBot;
 
   const Item({
     required this.syncId,
@@ -654,6 +659,7 @@ class Item {
     this.phoneNumber3,
     this.startsAt,
     this.validated = false,
+    this.viaBot = false,
   });
 
   List<String> get phones => [
@@ -695,6 +701,7 @@ class Item {
       phoneNumber3: clearPhone3   ? null : (phoneNumber3 ?? this.phoneNumber3),
       startsAt:     clearStartsAt ? null : (startsAt ?? this.startsAt),
       validated:    validated ?? this.validated,
+      viaBot:       viaBot,
     );
   }
 
@@ -712,6 +719,7 @@ class Item {
         'phoneNumber3': phoneNumber3,
         'startsAt':     startsAt?.toIso8601String(),
         'validated':    validated,
+        'viaBot':       viaBot,
       };
 
   factory Item.fromJson(Map<String, dynamic> json) => Item(
@@ -732,6 +740,7 @@ class Item {
         startsAt:     json['startsAt'] != null
             ? DateTime.parse(json['startsAt'] as String) : null,
         validated:    json['validated'] as bool? ?? false,
+        viaBot:       json['viaBot'] as bool? ?? false,
       );
 
   // Format compact pentru SMS (câmpuri opționale omise dacă sunt goale/null)
@@ -747,6 +756,7 @@ class Item {
         if (phoneNumber3 != null && phoneNumber3!.isNotEmpty) 'p3': phoneNumber3,
         if (startsAt != null) 'st': _isoShort(startsAt!),
         if (validated) 'v': true,
+        if (viaBot) 'b': true,
       };
 
   factory Item.fromSyncJson(Map<String, dynamic> j) => Item(
@@ -762,6 +772,7 @@ class Item {
         phoneNumber3: j['p3'] as String?,
         startsAt:     j['st'] != null ? DateTime.parse(j['st'] as String) : null,
         validated:    j['v'] == true,
+        viaBot:       j['b'] == true,
       );
 }
 

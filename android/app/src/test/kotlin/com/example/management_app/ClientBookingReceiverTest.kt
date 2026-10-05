@@ -133,4 +133,15 @@ class ClientBookingReceiverTest {
         )
         assertEquals(1, state.getInt("dayCount"))
     }
+
+    @Test
+    fun `rezervarea facuta de bot e marcata (fara SMS EXPIRAT)`() {
+        receiver.handleMessage(context, client, "liber")
+        receiver.handleMessage(context, client, "1")
+        val arr = JSONArray(SmsSyncReceiver.snapshot(context))
+        val msg = arr.getJSONObject(0).getString("msg")
+        assertTrue(msg.startsWith("ORG:A:"))
+        assertEquals(true, JSONObject(msg.removePrefix("ORG:A:")).getBoolean("b"))
+    }
 }
+
