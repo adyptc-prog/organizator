@@ -172,4 +172,16 @@ void main() {
       expect(tester.takeException(), isNull); // fără RenderFlex overflow
     });
   });
+
+  testWidgets('aplicația de salon nu mai are modul Pensiune', (tester) async {
+    await tester.pumpWidget(const ManagementApp());
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.hotel), findsNothing);
+
+    await tester.tap(find.byIcon(Icons.add_circle_rounded));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Check-in'), findsNothing);
+    expect(find.text('Data expirare: nesetată'), findsOneWidget);
+  });
 }
+

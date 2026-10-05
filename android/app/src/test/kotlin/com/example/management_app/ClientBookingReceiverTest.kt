@@ -143,5 +143,12 @@ class ClientBookingReceiverTest {
         assertTrue(msg.startsWith("ORG:A:"))
         assertEquals(true, JSONObject(msg.removePrefix("ORG:A:")).getBoolean("b"))
     }
+
+    @Test
+    fun `mesajele de sincronizare ale ambelor aplicatii sunt ignorate`() {
+        receiver.handleMessage(context, client, "ORG:D:abc")
+        receiver.handleMessage(context, client, "PEN:D:abc")
+        assertNull(lastSent())
+    }
 }
 

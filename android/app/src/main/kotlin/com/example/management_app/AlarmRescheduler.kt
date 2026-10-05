@@ -66,11 +66,6 @@ object AlarmRescheduler {
                 }
                 val itemsJson = prefs.getString(itemsKey, null) ?: continue
                 rescheduleBoard(context, prefs, JSONArray(itemsJson), boardIndex, now)
-                if (boardId.isNotEmpty() &&
-                    BookingSettings.loadSettings(context, boardId).mode == BoardMode.ZILE
-                ) {
-                    rescheduleValidationAlarms(context, prefs, JSONArray(itemsJson), now)
-                }
             }
         } catch (_: Exception) {
             // Date corupte / neașteptate — nu blocăm boot-ul aplicației
@@ -125,29 +120,5 @@ object AlarmRescheduler {
     private fun rearmSms(context: Context, prefs: SharedPreferences, id: Int, triggerAtMs: Long) {
         if (!prefs.contains("flutter.sms_alarm_$id")) return
         AlarmScheduler.scheduleSmsAlarm(context, id, triggerAtMs)
-    }
-
-    // Rearmează termenul de 24h pentru validarea plății (tabele „zile”) —
-    // itemii deja validați sau fără syncId/createdAt sunt ignorați. Termenul
-    // se recalculează mereu din createdAt (nu se stochează separat), deci
-    // rearmarea e idempotentă indiferent de câte ori rulează.
-    private fun rescheduleValidationAlarms(
-        context: Context, prefs: SharedPreferences, items: JSONArray, now: Long,
-    ) {
-        for (i in 0 until items.length()) {
-            val item = items.optJSONObject(i) ?: continue
-            if (item.optBoolean("validated", false)) continue
-            val syncId = item.optString("syncId", "")
-            if (syncId.isEmpty()) continue
-            val createdAtMs = parseIso(item.optString("createdAt", "")) ?: continue
-            val deadlineMs = createdAtMs + 24L * 60 * 60 * 1000
-
-            val alarmId = AlarmScheduler.validationAlarmId(syncId)
-            if (!prefs.contains("flutter.validation_alarm_$alarmId")) continue
-            // Dacă termenul a trecut deja cât timp telefonul a fost oprit,
-            // declanșăm aproape imediat, ca rezervarea neplătită să fie tot
-            // anulată, doar cu întârziere — nu ignorată definitiv.
-            AlarmScheduler.scheduleValidationAlarm(context, alarmId, maxOf(deadlineMs, now + 5_000))
-        }
     }
 }

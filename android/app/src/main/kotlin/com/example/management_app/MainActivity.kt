@@ -136,22 +136,6 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
-                    "scheduleValidation" -> {
-                        val id = call.argument<Int>("id")
-                            ?: run { result.error("ARG", "missing id", null); return@setMethodCallHandler }
-                        val triggerAtMs = call.argument<Long>("triggerAtMs")
-                            ?: run { result.error("ARG", "missing triggerAtMs", null); return@setMethodCallHandler }
-                        AlarmScheduler.scheduleValidationAlarm(this, id, triggerAtMs)
-                        result.success(null)
-                    }
-
-                    "cancelValidation" -> {
-                        val id = call.argument<Int>("id")
-                            ?: run { result.error("ARG", "missing id", null); return@setMethodCallHandler }
-                        AlarmScheduler.cancelValidationAlarm(this, id)
-                        result.success(null)
-                    }
-
                     "scheduleNotif" -> {
                         val id          = call.argument<Int>("id")
                             ?: run { result.error("ARG", "missing id", null); return@setMethodCallHandler }
@@ -195,8 +179,7 @@ class MainActivity : FlutterActivity() {
                             ?: run { result.error("ARG", "missing boardId", null); return@setMethodCallHandler }
                         val horizonDays = call.argument<Int>("horizonDays") ?: 14
                         val maxResults  = call.argument<Int>("maxResults") ?: 200
-                        val nights      = call.argument<Int>("nights")
-                        result.success(computeFreeSlotsJson(boardId, horizonDays, maxResults, nights))
+                        result.success(computeFreeSlotsJson(boardId, horizonDays, maxResults))
                     }
 
                     "getSmsFailure" -> result.success(SmsStatus.pendingFailure(this))
@@ -390,20 +373,13 @@ class MainActivity : FlutterActivity() {
 
     // ── Calcul sloturi libere (folosit de ecranul „Spatiere” pe Android — aceeași
     // sursă de adevăr ca botul de rezervări din ClientBookingReceiver) ──────────
-    private fun computeFreeSlotsJson(boardId: String, horizonDays: Int, maxResults: Int, nights: Int?): String {
+    private fun computeFreeSlotsJson(boardId: String, horizonDays: Int, maxResults: Int): String {
         return try {
             val settings = BookingSettings.loadSettings(this, boardId)
-            val slots = if (settings.mode == BoardMode.ZILE) {
-                val busy = BookingSettings.loadZileBusyRanges(this, boardId)
-                DayRangeCalculator.compute(
-                    busy, settings, java.time.LocalDateTime.now(), horizonDays, nights ?: 1, maxResults
-                )
-            } else {
-                val busy = BookingSettings.loadBusyIntervals(this, boardId, settings.durationMin)
-                FreeSlotCalculator.compute(
-                    busy, settings, java.time.LocalDateTime.now(), horizonDays, maxResults
-                )
-            }
+            val busy = BookingSettings.loadBusyIntervals(this, boardId, settings.durationMin)
+            val slots = FreeSlotCalculator.compute(
+                busy, settings, java.time.LocalDateTime.now(), horizonDays, maxResults
+            )
             val arr = JSONArray()
             val zone = java.time.ZoneId.systemDefault()
             for (s in slots) {

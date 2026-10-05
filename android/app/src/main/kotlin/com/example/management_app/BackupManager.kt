@@ -29,7 +29,7 @@ object BackupManager {
 
     const val AUTO_KEEP = 14
 
-    private val ALARM_KEY = Regex("""^flutter\.(notif|sms|validation)_alarm_(-?\d+)$""")
+    private val ALARM_KEY = Regex("""^flutter\.(notif|sms)_alarm_(-?\d+)$""")
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -295,7 +295,6 @@ object BackupManager {
             when (match.groupValues[1]) {
                 "notif" -> AlarmScheduler.cancelNotifAlarm(context, id)
                 "sms" -> AlarmScheduler.cancelSmsAlarm(context, id)
-                "validation" -> AlarmScheduler.cancelValidationAlarm(context, id)
             }
         }
     }

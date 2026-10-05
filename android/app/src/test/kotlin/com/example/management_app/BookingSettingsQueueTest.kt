@@ -46,13 +46,6 @@ class BookingSettingsQueueTest {
     }
 
     @Test
-    fun `sejurul rezervat ramane ocupat chiar daca alta intrare e corupta`() {
-        val busy = BookingSettings.loadZileBusyRanges(context, "b1")
-        assertEquals(1, busy.size)
-        assertEquals(LocalDateTime.of(2030, 1, 10, 14, 0), busy[0].startMin)
-    }
-
-    @Test
     fun `rezervarea din coada poate fi anulata chiar daca alta intrare e corupta`() {
         val items = BookingSettings.loadBookedItems(context, "b1")
         assertEquals(listOf("valid1"), items.map { it.syncId })

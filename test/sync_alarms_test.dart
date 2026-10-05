@@ -20,18 +20,7 @@ Map<String, Object?> _item(int number, String syncId, String phone) => {
       'phoneNumber': phone,
       'phoneNumber2': null,
       'phoneNumber3': null,
-      'startsAt': null,
-      'validated': false,
     };
-
-// Același algoritm ca java.lang.String.hashCode() (vezi ValidationService).
-int _javaHash(String s) {
-  var h = 0;
-  for (final u in s.codeUnits) {
-    h = (h * 31 + u) & 0xFFFFFFFF;
-  }
-  return h > 0x7FFFFFFF ? h - 0x100000000 : h;
-}
 
 void main() {
   late List<MethodCall> calls;
@@ -116,12 +105,6 @@ void main() {
     expect(lastSmsOp(320), 'cancel');
     expect(lastNotifOp(31), 'cancelNotif');
     expect(lastNotifOp(32), 'cancelNotif');
-    expect(
-      calls.any((c) =>
-          c.method == 'cancelValidation' &&
-          (c.arguments as Map)['id'] == _javaHash('cccc')),
-      isTrue,
-    );
 
     final prefs = await SharedPreferences.getInstance();
     expect(prefs.containsKey('sms_alarm_310'), isFalse);

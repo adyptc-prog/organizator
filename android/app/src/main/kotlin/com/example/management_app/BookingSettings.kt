@@ -8,22 +8,13 @@ import java.time.format.DateTimeFormatter
 
 data class BoardInfo(val id: String, val name: String)
 
-// „interval” (salon, programări cu durată fixă) vs „zile” (pensiune, sejururi
-// de lungime variabilă pe zile întregi).
-enum class BoardMode { INTERVAL, ZILE }
-
 data class BoardBookingSettings(
     val enabled: Boolean,
     val durationMin: Int,
-    // Mod „interval”: program de lucru. Mod „zile”: ora de check-in/check-out.
+    // Program de lucru (minute de la miezul nopții).
     val workStartMin: Int,
     val workEndMin: Int,
-    // Mod „interval”: zile complet închise. Mod „zile”: zile fără check-in.
     val closedDays: Set<Int>, // 1=luni .. 7=duminică, la fel ca DateTime.weekday din Dart
-    val mode: BoardMode,
-    // Cont bancar afișat clientului în SMS-ul „așteaptă validarea plății”
-    // (doar mod „zile”). Gol dacă proprietarul nu l-a completat.
-    val iban: String,
 )
 
 data class BusyInterval(val startMin: LocalDateTime, val endMin: LocalDateTime)
@@ -35,8 +26,6 @@ data class BookedItem(
     val description: String,
     val phones: List<String>,
     val expiresAt: LocalDateTime?,
-    val startsAt: LocalDateTime?,
-    val validated: Boolean,
 )
 
 /**
@@ -85,9 +74,6 @@ object BookingSettings {
             workStartMin = getIntCompat(p, "flutter.work_start_$boardId", 9 * 60),
             workEndMin = getIntCompat(p, "flutter.work_end_$boardId", 18 * 60),
             closedDays = closed,
-            mode = if (p.getString("flutter.board_mode_$boardId", "interval") == "zile")
-                BoardMode.ZILE else BoardMode.INTERVAL,
-            iban = p.getString("flutter.iban_$boardId", "") ?: "",
         )
         Diag.i("loadSettings: boardId=$boardId -> $result")
         return result
@@ -178,8 +164,6 @@ object BookingSettings {
                     if (phones.isEmpty()) continue
                     val expiresStr = o.optString("expiresAt", "")
                     val expiresAt = if (o.isNull("expiresAt") || expiresStr.isEmpty()) null else parseFlexibleIso(expiresStr)
-                    val startsStr = o.optString("startsAt", "")
-                    val startsAt = if (o.isNull("startsAt") || startsStr.isEmpty()) null else parseFlexibleIso(startsStr)
                     result[syncId] = BookedItem(
                         boardId = boardId,
                         syncId = syncId,
@@ -187,8 +171,6 @@ object BookingSettings {
                         description = o.optString("description", ""),
                         phones = phones,
                         expiresAt = expiresAt,
-                        startsAt = startsAt,
-                        validated = o.optBoolean("validated", false),
                     )
                 }
             } catch (e: Exception) {
@@ -213,7 +195,6 @@ object BookingSettings {
             )
             if (phones.isEmpty()) continue
             val expiresStr = j.optString("e", "")
-            val startsStr = j.optString("st", "")
             result[syncId] = BookedItem(
                 boardId = boardId,
                 syncId = syncId,
@@ -221,57 +202,10 @@ object BookingSettings {
                 description = j.optString("d", ""),
                 phones = phones,
                 expiresAt = if (expiresStr.isEmpty()) null else parseFlexibleIso(expiresStr),
-                startsAt = if (startsStr.isEmpty()) null else parseFlexibleIso(startsStr),
-                validated = j.optBoolean("v", false),
             )
         }
 
         return result.values.toList()
-    }
-
-    // Intervalul ocupat al unui sejur (mod „zile”) = [startsAt, expiresAt) —
-    // spre deosebire de modul „interval”, durata nu mai e fixă per tabel (clientul
-    // o alege prin SMS), deci nu se poate deduce dintr-o valoare unică de tabel.
-    // Sejururile fără startsAt (introduse manual, fără câmpul de check-in) sunt
-    // aproximate la 1 noapte înainte de expiresAt, ca să nu fie ignorate din calcul.
-    fun loadZileBusyRanges(context: Context, boardId: String): List<BusyInterval> {
-        val p = prefs(context)
-        val result = mutableListOf<BusyInterval>()
-
-        val itemsJson = p.getString("flutter.management_items_$boardId", null)
-        if (itemsJson != null) {
-            try {
-                val arr = JSONArray(itemsJson)
-                for (i in 0 until arr.length()) {
-                    val o = arr.optJSONObject(i) ?: continue
-                    val expiresStr = o.optString("expiresAt", "")
-                    if (o.isNull("expiresAt") || expiresStr.isEmpty()) continue
-                    val end = parseFlexibleIso(expiresStr) ?: continue
-                    val startsStr = o.optString("startsAt", "")
-                    val start = if (o.isNull("startsAt") || startsStr.isEmpty()) {
-                        end.minusDays(1)
-                    } else {
-                        parseFlexibleIso(startsStr) ?: end.minusDays(1)
-                    }
-                    result.add(BusyInterval(start, end))
-                }
-            } catch (e: Exception) {
-                Diag.e("loadZileBusyRanges: JSON parse failed for boardId=$boardId", e)
-            }
-        }
-
-        // La fel ca la loadBusyIntervals: și rezervările din coada de sincronizare
-        // neprocesate încă trebuie tratate ca ocupate.
-        for ((prefix, payload) in queuedEntries(context, boardId)) {
-            if (prefix !in ITEM_PREFIXES) continue
-            val j = parsePayload(payload) ?: continue
-            val end = parseFlexibleIso(j.optString("e", "")) ?: continue
-            val startsStr = j.optString("st", "")
-            val start = if (startsStr.isEmpty()) end.minusDays(1) else (parseFlexibleIso(startsStr) ?: end.minusDays(1))
-            result.add(BusyInterval(start, end))
-        }
-
-        return result
     }
 
     // Intrările din coada de sincronizare pentru un tabel, încă neprocesate de
