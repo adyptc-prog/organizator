@@ -1,7 +1,6 @@
 package com.example.management_app
 
 import android.content.Context
-import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDateTime
@@ -90,7 +89,7 @@ object BookingSettings {
                 BoardMode.ZILE else BoardMode.INTERVAL,
             iban = p.getString("flutter.iban_$boardId", "") ?: "",
         )
-        Log.i("OrgDiag", "loadSettings: boardId=$boardId -> $result")
+        Diag.i("loadSettings: boardId=$boardId -> $result")
         return result
     }
 
@@ -112,7 +111,7 @@ object BookingSettings {
         val result = mutableListOf<BusyInterval>()
 
         val itemsJson = p.getString("flutter.management_items_$boardId", null)
-        Log.i("OrgDiag", "loadBusyIntervals: key=flutter.management_items_$boardId present=${itemsJson != null} len=${itemsJson?.length}")
+        Diag.i("loadBusyIntervals: key=flutter.management_items_$boardId present=${itemsJson != null} len=${itemsJson?.length}")
         if (itemsJson != null) {
             try {
                 val arr = JSONArray(itemsJson)
@@ -124,12 +123,12 @@ object BookingSettings {
                     val expiresStr = o.optString("expiresAt", "")
                     if (expiresStr.isEmpty()) { skippedNoExpiry++; continue }
                     val end = parseFlexibleIso(expiresStr)
-                    if (end == null) { skippedBadDate++; Log.w("OrgDiag", "loadBusyIntervals: unparsable expiresAt=\"$expiresStr\""); continue }
+                    if (end == null) { skippedBadDate++; Diag.w("loadBusyIntervals: unparsable expiresAt=\"$expiresStr\""); continue }
                     result.add(BusyInterval(end.minusMinutes(durationMin.toLong()), end))
                 }
-                Log.i("OrgDiag", "loadBusyIntervals: totalItems=${arr.length()} busyParsed=${result.size} skippedNoExpiry=$skippedNoExpiry skippedBadDate=$skippedBadDate")
+                Diag.i("loadBusyIntervals: totalItems=${arr.length()} busyParsed=${result.size} skippedNoExpiry=$skippedNoExpiry skippedBadDate=$skippedBadDate")
             } catch (e: Exception) {
-                Log.e("OrgDiag", "loadBusyIntervals: JSON parse failed for boardId=$boardId", e)
+                Diag.e("loadBusyIntervals: JSON parse failed for boardId=$boardId", e)
             }
         }
 
@@ -193,7 +192,7 @@ object BookingSettings {
                     )
                 }
             } catch (e: Exception) {
-                Log.e("OrgDiag", "loadBookedItems: JSON parse failed for boardId=$boardId", e)
+                Diag.e("loadBookedItems: JSON parse failed for boardId=$boardId", e)
             }
         }
 
@@ -257,7 +256,7 @@ object BookingSettings {
                     result.add(BusyInterval(start, end))
                 }
             } catch (e: Exception) {
-                Log.e("OrgDiag", "loadZileBusyRanges: JSON parse failed for boardId=$boardId", e)
+                Diag.e("loadZileBusyRanges: JSON parse failed for boardId=$boardId", e)
             }
         }
 
@@ -299,7 +298,7 @@ object BookingSettings {
     private fun parsePayload(payload: String): JSONObject? = try {
         JSONObject(payload)
     } catch (_: Exception) {
-        Log.w("OrgDiag", "queued sync entry skipped: invalid JSON")
+        Diag.w("queued sync entry skipped: invalid JSON")
         null
     }
 

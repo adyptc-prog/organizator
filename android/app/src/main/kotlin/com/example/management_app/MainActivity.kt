@@ -5,7 +5,6 @@ import android.content.Intent
 import android.os.Build
 import android.provider.DocumentsContract
 import android.util.Base64
-import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -456,7 +455,7 @@ class MainActivity : FlutterActivity() {
             }
             arr.toString()
         } catch (e: Exception) {
-            Log.e("OrgDiag", "computeFreeSlotsJson failed for boardId=$boardId", e)
+            Diag.e("computeFreeSlotsJson failed for boardId=$boardId", e)
             "[]"
         }
     }

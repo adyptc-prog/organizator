@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.telephony.SmsManager
-import android.util.Log
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -49,12 +48,12 @@ object SmsSender {
             } else {
                 smsManager.sendTextMessage(phone, null, message, sentIntents.firstOrNull(), null)
             }
-            Log.i("OrgDiag", "SmsSender: queued to=$phone parts=${parts.size} len=${message.length}")
+            Diag.i("SmsSender: queued to=${Diag.mask(phone)} parts=${parts.size} len=${message.length}")
         } catch (e: SecurityException) {
-            Log.e("OrgDiag", "SmsSender: no permission to=$phone", e)
+            Diag.e("SmsSender: no permission to=${Diag.mask(phone)}", e)
             SmsStatus.recordFailure(app, phone, SmsStatus.PERMISSION_MISSING)
         } catch (e: Exception) {
-            Log.e("OrgDiag", "SmsSender: FAILED to=$phone", e)
+            Diag.e("SmsSender: FAILED to=${Diag.mask(phone)}", e)
             SmsStatus.recordFailure(app, phone, e.message ?: e.toString())
         }
     }
@@ -77,7 +76,7 @@ class SmsSentReceiver : BroadcastReceiver() {
         if (resultCode == Activity.RESULT_OK) {
             SmsStatus.recordSuccess(context)
         } else {
-            Log.e("OrgDiag", "SmsSentReceiver: FAILED to=$phone code=$resultCode")
+            Diag.e("SmsSentReceiver: FAILED to=${Diag.mask(phone)} code=$resultCode")
             SmsStatus.recordFailure(context, phone, SmsStatus.describe(resultCode))
         }
     }

@@ -23,6 +23,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    buildFeatures {
+        // BuildConfig.DEBUG — jurnalul detaliat (Diag) doar în debug.
+        buildConfig = true
+    }
+
     kotlinOptions {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }

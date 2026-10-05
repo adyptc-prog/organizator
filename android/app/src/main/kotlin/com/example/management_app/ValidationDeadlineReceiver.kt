@@ -3,7 +3,6 @@ package com.example.management_app
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.util.Log
 import org.json.JSONObject
 
 /**
@@ -29,7 +28,7 @@ class ValidationDeadlineReceiver : BroadcastReceiver() {
             try {
                 handle(appContext, alarmId)
             } catch (e: Exception) {
-                Log.e("OrgDiag", "ValidationDeadlineReceiver: failed for alarmId=$alarmId", e)
+                Diag.e("ValidationDeadlineReceiver: failed for alarmId=$alarmId", e)
             } finally {
                 pending.finish()
             }

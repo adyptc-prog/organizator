@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.provider.Telephony
-import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.SecureRandom
@@ -83,7 +82,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
     }
 
     override fun onReceive(context: Context, intent: Intent) {
-        Log.i("OrgDiag", "onReceive action=${intent.action}")
+        Diag.i("onReceive action=${intent.action}")
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
         val pdus = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
 
@@ -93,7 +92,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
             val body   = sms.messageBody        ?: continue
             bySender.getOrPut(sender) { StringBuilder() }.append(body)
         }
-        Log.i("OrgDiag", "onReceive senders=${bySender.keys}")
+        Diag.i("onReceive senders=${bySender.keys.map { Diag.mask(it) }}")
         if (bySender.isEmpty()) return
 
         val pending = goAsync()
@@ -104,7 +103,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
                     try {
                         handleMessage(appContext, sender, sb.toString())
                     } catch (e: Exception) {
-                        Log.e("OrgDiag", "handleMessage threw for sender=$sender", e)
+                        Diag.e("handleMessage threw for sender=${Diag.mask(sender)}", e)
                     }
                 }
             } finally {
@@ -122,38 +121,37 @@ class ClientBookingReceiver : BroadcastReceiver() {
 
     // internal: apelat direct de testele Robolectric (fără SMS-uri reale).
     internal fun handleMessage(context: Context, sender: String, rawBody: String) {
-        Log.i("OrgDiag", "handleMessage sender=$sender rawBody=\"$rawBody\"")
+        Diag.i("handleMessage sender=${Diag.mask(sender)} len=${rawBody.length}")
         if (rawBody.startsWith("ORG:")) {
-            Log.i("OrgDiag", "handleMessage: ignored, looks like sync message (ORG:)")
+            Diag.i("handleMessage: ignored, looks like sync message (ORG:)")
             return
         }
 
         val senderDigits = digitsOnly(sender)
         if (senderDigits.isEmpty()) {
-            Log.w("OrgDiag", "handleMessage: senderDigits empty, aborting")
+            Diag.w("handleMessage: senderDigits empty, aborting")
             return
         }
         if (!BotLimits.isReplyableSender(sender)) {
-            Log.i("OrgDiag", "handleMessage: sender is not a phone number, ignoring")
+            Diag.i("handleMessage: sender is not a phone number, ignoring")
             return
         }
         if (isSyncPartner(context, senderDigits)) {
-            Log.i("OrgDiag", "handleMessage: sender=$senderDigits matched sync_partner_phone, ignoring")
+            Diag.i("handleMessage: sender=${Diag.mask(senderDigits)} matched sync_partner_phone, ignoring")
             return
         }
 
         val body = normalize(rawBody)
-        Log.i("OrgDiag", "handleMessage: normalized body=\"$body\"")
         if (body.isEmpty()) return
 
         val liberMatch  = LIBER_RE.find(body)
         val cancelMatch = CANCEL_RE.find(body)
         val numberMatch = NUMBER_RE.find(body)
-        Log.i("OrgDiag", "handleMessage: liberMatch=${liberMatch != null} cancelMatch=${cancelMatch != null} numberMatch=${numberMatch != null}")
+        Diag.i("handleMessage: liberMatch=${liberMatch != null} cancelMatch=${cancelMatch != null} numberMatch=${numberMatch != null}")
 
         val isCommand = liberMatch != null || body == "next" || cancelMatch != null || numberMatch != null
         if (!isCommand) {
-            Log.i("OrgDiag", "handleMessage: no pattern matched, ignoring silently (by design)")
+            Diag.i("handleMessage: no pattern matched, ignoring silently (by design)")
             return
         }
         // Fiecare răspuns e un SMS plătit — limităm cât poate cere un număr
@@ -161,7 +159,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
         // refuz ar costa la fel).
         val limit = registerCommand(context, senderDigits)
         if (limit != BotLimits.Decision.ALLOW) {
-            Log.w("OrgDiag", "handleMessage: rate limited ($limit)")
+            Diag.w("handleMessage: rate limited ($limit)")
             return
         }
 
@@ -237,7 +235,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
             val minLen = minOf(senderDigits.length, partnerDigits.length)
             if (minLen < 7) continue
             if (senderDigits.takeLast(minLen) == partnerDigits.takeLast(minLen)) {
-                Log.i("OrgDiag", "isSyncPartner: MATCH key=$key partnerDigits=$partnerDigits senderDigits=$senderDigits")
+                Diag.i("isSyncPartner: MATCH key=$key sender=${Diag.mask(senderDigits)}")
                 return true
             }
         }
@@ -367,9 +365,9 @@ class ClientBookingReceiver : BroadcastReceiver() {
     // ── Flux „liber” / „liber <tabel>” ──────────────────────────────────────────
     private fun startOffer(context: Context, sender: String, senderDigits: String, token: String?) {
         val boards = BookingSettings.loadBoards(context)
-        Log.i("OrgDiag", "startOffer: boards=${boards.map { it.id + "/" + it.name }} token=$token")
+        Diag.i("startOffer: boards=${boards.map { it.id }} hasToken=${token != null}")
         if (boards.isEmpty()) {
-            Log.w("OrgDiag", "startOffer: no boards found, aborting")
+            Diag.w("startOffer: no boards found, aborting")
             return
         }
 
@@ -381,7 +379,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
         }
 
         val settings = BookingSettings.loadSettings(context, board.id)
-        Log.i("OrgDiag", "startOffer: board=${board.id} settings.enabled=${settings.enabled} mode=${settings.mode}")
+        Diag.i("startOffer: board=${board.id} settings.enabled=${settings.enabled} mode=${settings.mode}")
         if (!settings.enabled) {
             sendSms(context, sender, "Rezervările prin SMS nu sunt active pentru ${board.name}.")
             return

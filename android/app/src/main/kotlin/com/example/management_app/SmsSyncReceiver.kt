@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.provider.Telephony
-import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -191,7 +190,7 @@ class SmsSyncReceiver : BroadcastReceiver() {
             }
         }
         if (boardId == null || body == null) {
-            Log.w("OrgDiag", "sync message rejected: unknown sender or invalid signature")
+            Diag.w("sync message rejected: unknown sender or invalid signature")
             return
         }
 
@@ -200,9 +199,9 @@ class SmsSyncReceiver : BroadcastReceiver() {
                 val decision = LicenseStore.adoptFromPartner(
                     context, body.removePrefix(LICENSE_PREFIX)
                 )
-                Log.i("OrgDiag", "license from partner: $decision")
+                Diag.i("license from partner: $decision")
             } catch (e: Exception) {
-                Log.e("OrgDiag", "license from partner FAILED", e)
+                Diag.e("license from partner FAILED", e)
             }
             return
         }
