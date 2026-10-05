@@ -7,10 +7,10 @@ import 'license_service.dart';
 // Status, cod de instalare, import fișier și transmiterea licenței către
 // telefonul partener (licența cumpărată acoperă ambele telefoane sincronizate).
 class LicenseScreen extends StatefulWidget {
-  // Trimite licența partenerilor de sincronizare; întoarce câte telefoane,
-  // sau un număr negativ dacă trimiterea a fost oprită (ex. SMS blocat) și
-  // utilizatorul a fost deja informat.
-  final Future<int> Function()? onShareWithPartners;
+  // Trimite licența partenerilor de sincronizare; întoarce rezultatul, sau
+  // null dacă trimiterea a fost oprită (ex. SMS blocat) și utilizatorul a
+  // fost deja informat.
+  final Future<LicenseShareOutcome?> Function()? onShareWithPartners;
 
   const LicenseScreen({super.key, this.onShareWithPartners});
 
@@ -39,9 +39,13 @@ class _LicenseScreenState extends State<LicenseScreen> {
     }
   }
 
+  ({bool fromPartner, String? sharedWith}) _shareInfo =
+      (fromPartner: false, sharedWith: null);
+
   Future<void> _refresh() => _run(() async {
         await LicenseService.checkNewLicense();
         _businessId = await LicenseService.getBusinessId();
+        _shareInfo = await LicenseService.getShareInfo();
       });
 
   void _snack(String text, {Color? color}) {
@@ -63,12 +67,25 @@ class _LicenseScreenState extends State<LicenseScreen> {
       });
 
   Future<void> _share() => _run(() async {
-        final sent = await widget.onShareWithPartners!.call();
-        if (!mounted || sent < 0) return;
-        _snack(sent == 0
-            ? 'Niciun telefon partener configurat pentru sincronizare.'
-            : 'Licența a fost trimisă prin SMS la $sent '
-                '${sent == 1 ? 'telefon' : 'telefoane'}.');
+        final r = await widget.onShareWithPartners!.call();
+        if (!mounted || r == null) return; // SMS blocat — explicat deja
+        if (r.sent > 0) {
+          _snack('Licența a fost trimisă prin SMS la ${r.sent} '
+              '${r.sent == 1 ? 'telefon' : 'telefoane'}.');
+        } else if (r.refused == 'other_partner') {
+          _snack(
+              'Licența e deja folosită pe al doilea telefon '
+              '(${_shareInfo.sharedWith ?? 'partenerul inițial'}) și nu poate fi '
+              'trimisă la alt număr.',
+              color: Colors.orange.shade800);
+        } else if (r.refused == 'not_owner') {
+          _snack('Licența a fost primită de la telefonul partener și nu poate '
+              'fi trimisă mai departe.',
+              color: Colors.orange.shade800);
+        } else {
+          _snack('Niciun telefon partener configurat pentru sincronizare.');
+        }
+        _shareInfo = await LicenseService.getShareInfo();
       });
 
   static String _formatDate(DateTime d) =>
@@ -133,8 +150,10 @@ class _LicenseScreenState extends State<LicenseScreen> {
   @override
   Widget build(BuildContext context) {
     final status = _status();
+    // Doar telefonul care a importat licența o poate trimite.
     final canShare = widget.onShareWithPartners != null &&
-        LicenseService.isNewLicenseActive;
+        LicenseService.isNewLicenseActive &&
+        !_shareInfo.fromPartner;
 
     return Scaffold(
       appBar: AppBar(
@@ -176,6 +195,20 @@ class _LicenseScreenState extends State<LicenseScreen> {
               ),
             ),
           ),
+          if (LicenseService.isNewLicenseActive &&
+              (_shareInfo.fromPartner || _shareInfo.sharedWith != null)) ...[
+            const SizedBox(height: 12),
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.phonelink_ring_outlined),
+                title: Text(_shareInfo.fromPartner
+                    ? 'Licență primită de la telefonul partener'
+                    : 'Folosită și pe telefonul ${_shareInfo.sharedWith}'),
+                subtitle: const Text(
+                    'O licență acoperă două telefoane sincronizate.'),
+              ),
+            ),
+          ],
           const SizedBox(height: 16),
           FilledButton.icon(
             icon: const Icon(Icons.folder_open),

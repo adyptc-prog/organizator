@@ -24,6 +24,7 @@ void main() {
   late Map<String, Object?> checkResponse;
   late Object? pickResponse; // Map sau PlatformException
   late List<String> calls;
+  late Map<String, Object?> shareInfo;
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
@@ -32,6 +33,7 @@ void main() {
     checkResponse = {'status': 'missing', 'message': 'No license file selected.'};
     pickResponse = null;
     calls = [];
+    shareInfo = {'fromPartner': false, 'sharedWith': null};
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(_channel, (call) async {
       calls.add(call.method);
@@ -45,8 +47,8 @@ void main() {
         case 'pickLicenseFile':
           if (pickResponse is PlatformException) throw pickResponse!;
           return pickResponse;
-        case 'getShareableLicense':
-          return checkResponse['status'] == 'active' ? '{"payload":{}}' : null;
+        case 'getLicenseShareInfo':
+          return shareInfo;
         case 'consumePartnerNotice':
           return false;
       }
@@ -150,7 +152,7 @@ void main() {
 
   group('LicenseScreen', () {
     Future<void> pumpScreen(WidgetTester tester,
-        {Future<int> Function()? onShare}) async {
+        {Future<LicenseShareOutcome?> Function()? onShare}) async {
       await LicenseService.load();
       await tester.pumpWidget(MaterialApp(
         home: LicenseScreen(onShareWithPartners: onShare),
@@ -159,7 +161,7 @@ void main() {
     }
 
     testWidgets('afișează trial-ul și codul de instalare', (tester) async {
-      await pumpScreen(tester, onShare: () async => 1);
+      await pumpScreen(tester, onShare: () async => (sent: 1, refused: null));
       expect(find.text('Perioadă de trial'), findsOneWidget);
       expect(find.text('organizator-1700000000000'), findsOneWidget);
       // Fără licență activă nu are ce trimite partenerului.
@@ -172,7 +174,7 @@ void main() {
       var shared = 0;
       await pumpScreen(tester, onShare: () async {
         shared++;
-        return 1;
+        return (sent: 1, refused: null);
       });
       expect(find.text('Licență activă'), findsOneWidget);
       expect(find.textContaining('200 zile rămase'), findsOneWidget);
@@ -187,7 +189,7 @@ void main() {
     testWidgets('trimitere oprită (SMS blocat): fără mesaj înșelător',
         (tester) async {
       checkResponse = _activeLicense();
-      await pumpScreen(tester, onShare: () async => -1);
+      await pumpScreen(tester, onShare: () async => null);
       await tester.tap(find.text('Trimite licența la telefonul partener'));
       await tester.pumpAndSettle();
       expect(find.textContaining('Licența a fost trimisă'), findsNothing);
@@ -205,7 +207,7 @@ void main() {
       var shared = 0;
       await pumpScreen(tester, onShare: () async {
         shared++;
-        return 1;
+        return (sent: 1, refused: null);
       });
       pickResponse = _activeLicense();
       checkResponse = _activeLicense();
@@ -226,5 +228,28 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('License signature is invalid.'), findsOneWidget);
     });
+  
+    testWidgets('al treilea telefon: trimiterea e refuzată, cu explicație',
+        (tester) async {
+      checkResponse = _activeLicense();
+      shareInfo = {'fromPartner': false, 'sharedWith': '***111'};
+      await pumpScreen(tester,
+          onShare: () async => (sent: 0, refused: 'other_partner'));
+      expect(find.text('Folosită și pe telefonul ***111'), findsOneWidget);
+      await tester.tap(find.text('Trimite licența la telefonul partener'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('deja folosită pe al doilea telefon (***111)'),
+          findsOneWidget);
+    });
+
+    testWidgets('licența primită de la partener nu poate fi trimisă mai departe',
+        (tester) async {
+      checkResponse = _activeLicense();
+      shareInfo = {'fromPartner': true, 'sharedWith': null};
+      await pumpScreen(tester, onShare: () async => (sent: 1, refused: null));
+      expect(find.text('Licență primită de la telefonul partener'), findsOneWidget);
+      expect(find.text('Trimite licența la telefonul partener'), findsNothing);
+    });
   });
 }
+

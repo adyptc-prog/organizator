@@ -536,8 +536,10 @@ class SyncService {
   // licența trimisă atunci a fost ignorată. Mesajele sunt tratate nativ, în
   // SmsSyncReceiver, doar dacă vin de la partenerul configurat.
   static Future<void> sendLicenseHandshake() async {
-    final license = await LicenseService.getShareableLicense();
-    await _send(license != null ? 'ORG:L:$license' : 'ORG:R:');
+    if (!isActive) return;
+    // Telefonul cu licență o trimite (dacă are voie); cel fără o cere.
+    final status = await LicenseService.shareWithBoard(_boardId);
+    if (status == 'no_license') await _send('ORG:R:');
   }
 
   // Tabelele cu partener și cod de împerechere, câte unul per număr de
@@ -557,17 +559,17 @@ class SyncService {
     return byPhone.values.toList();
   }
 
-  // Trimite licența activă tuturor partenerilor. Întoarce numărul de
-  // telefoane cărora le-a fost trimisă.
-  static Future<int> sendLicenseToAllPartners() async {
-    if (!isSupported) return 0;
-    final license = await LicenseService.getShareableLicense();
-    if (license == null) return 0;
+  // Trimite licența partenerilor (nativ refuză un al treilea telefon).
+  static Future<LicenseShareOutcome> sendLicenseToAllPartners() async {
+    if (!isSupported) return (sent: 0, refused: null);
     var sent = 0;
+    String? refused;
     for (final boardId in await pairedBoards()) {
-      if (await _sendForBoard(boardId, 'ORG:L:$license')) sent++;
+      final status = await LicenseService.shareWithBoard(boardId);
+      if (status == 'sent') sent++;
+      if (status == 'not_owner' || status == 'other_partner') refused = status;
     }
-    return sent;
+    return (sent: sent, refused: refused);
   }
 
   // Fiecare mesaj din coadă e etichetat de partea nativă cu tabelul al cărui
@@ -1095,11 +1097,11 @@ class _ManagementPageState extends State<ManagementPage>
     return false;
   }
 
-  // Negativ = SMS blocat (utilizatorul a văzut deja explicația).
-  Future<int> _shareLicenseWithPartners() async {
+  // null = SMS blocat (utilizatorul a văzut deja explicația).
+  Future<LicenseShareOutcome?> _shareLicenseWithPartners() async {
     // Fără parteneri nu e nimic de trimis — nici motiv să cerem permisiunea.
-    if ((await SyncService.pairedBoards()).isEmpty) return 0;
-    if (!await _ensureSmsPermission()) return -1;
+    if ((await SyncService.pairedBoards()).isEmpty) return (sent: 0, refused: null);
+    if (!await _ensureSmsPermission()) return null;
     return SyncService.sendLicenseToAllPartners();
   }
 

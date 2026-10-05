@@ -51,8 +51,17 @@ object BackupFormat {
     fun isBackedUpKey(key: String): Boolean =
         key.startsWith(FLUTTER_PREFIX) && key !in EXCLUDED_KEYS
 
-    /** Identitatea de licență inclusă în backup (codul de instalare + licența). */
-    data class Identity(val businessId: String?, val licenseJson: String?)
+    /**
+     * Identitatea de licență inclusă în backup: codul de instalare, licența,
+     * proveniența ei (fișier / partener) și partenerul căruia i-a fost trimisă.
+     */
+    data class Identity(
+        val businessId: String?,
+        val licenseJson: String?,
+        val licenseSource: String? = null,
+        val sharePartner: String? = null,
+        val shareLicenseId: String? = null,
+    )
 
     data class Backup(
         val createdAt: Long,
@@ -71,6 +80,9 @@ object BackupFormat {
         val identityJson = JSONObject()
         identity.businessId?.let { identityJson.put("businessId", it) }
         identity.licenseJson?.let { identityJson.put("license", it) }
+        identity.licenseSource?.let { identityJson.put("licenseSource", it) }
+        identity.sharePartner?.let { identityJson.put("sharePartner", it) }
+        identity.shareLicenseId?.let { identityJson.put("shareLicenseId", it) }
 
         val data = JSONObject()
             .put("prefs", prefsJson)
@@ -120,6 +132,9 @@ object BackupFormat {
             identity = Identity(
                 businessId = identityJson.optString("businessId").takeIf { it.isNotEmpty() },
                 licenseJson = identityJson.optString("license").takeIf { it.isNotEmpty() },
+                licenseSource = identityJson.optString("licenseSource").takeIf { it.isNotEmpty() },
+                sharePartner = identityJson.optString("sharePartner").takeIf { it.isNotEmpty() },
+                shareLicenseId = identityJson.optString("shareLicenseId").takeIf { it.isNotEmpty() },
             ),
         )
     }

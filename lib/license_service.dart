@@ -4,6 +4,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+// Rezultatul trimiterii licenței la parteneri: câte telefoane au primit-o și,
+// dacă a fost refuzată, de ce ('not_owner' — licența a venit de la partener;
+// 'other_partner' — e deja folosită pe alt telefon).
+typedef LicenseShareOutcome = ({int sent, String? refused});
+
 // ─── Serviciu licențiere ──────────────────────────────────────────────────────
 class LicenseService {
   static const _ch              = MethodChannel('organizator/license');
@@ -130,14 +135,31 @@ class LicenseService {
     }
   }
 
-  // Licența activă, compactată, de trimis telefonului partener (null dacă nu
-  // există una activă în formatul nou).
-  static Future<String?> getShareableLicense() async {
-    if (!_isAndroid) return null;
+  // Trimite licența partenerului tabelului [boardId] — nativ decide dacă are
+  // voie (licența acoperă exact două telefoane). Întoarce "sent",
+  // "no_license", "not_owner", "other_partner" sau "no_partner".
+  static Future<String> shareWithBoard(String boardId) async {
+    if (!_isAndroid) return 'no_license';
     try {
-      return await _ch.invokeMethod<String?>('getShareableLicense');
+      return await _ch.invokeMethod<String>(
+              'shareLicenseWithBoard', {'boardId': boardId}) ??
+          'no_license';
     } catch (_) {
-      return null;
+      return 'no_license';
+    }
+  }
+
+  // De unde vine licența și pe ce telefon (mascat) a fost trimisă.
+  static Future<({bool fromPartner, String? sharedWith})> getShareInfo() async {
+    if (!_isAndroid) return (fromPartner: false, sharedWith: null);
+    try {
+      final r = await _ch.invokeMethod<Map<Object?, Object?>>('getLicenseShareInfo');
+      return (
+        fromPartner: (r?['fromPartner'] as bool?) ?? false,
+        sharedWith: r?['sharedWith'] as String?,
+      );
+    } catch (_) {
+      return (fromPartner: false, sharedWith: null);
     }
   }
 

@@ -54,6 +54,17 @@ enum class AdoptionDecision {
     RENEW,
 }
 
+/** Dacă licența acestui telefon poate fi trimisă unui anumit partener. */
+enum class ShareDecision {
+    SEND,
+    /** Nicio licență activă de trimis. */
+    NO_LICENSE,
+    /** Licența a venit de la partener — doar telefonul care a importat-o o împarte. */
+    NOT_OWNER,
+    /** Licența e deja folosită pe alt telefon partener. */
+    OTHER_PARTNER,
+}
+
 /**
  * Logică pură (fără Android) — testabilă pe JVM. Base64 e injectat pentru că
  * android.util.Base64 nu există în testele JVM, iar java.util.Base64 cere
@@ -174,6 +185,27 @@ class LicenseVerifier(
          * - pe același cod, se acceptă doar o licență care expiră mai târziu
          *   (reînnoire cumpărată pe celălalt telefon).
          */
+        /**
+         * O licență cumpărată acoperă exact două telefoane: cel care a importat
+         * fișierul și UN partener. Primul partener căruia i se trimite rămâne
+         * legat de licență ([boundLicenseId] + [boundPhone]); la o licență nouă
+         * (reînnoire = alt licenseId) se poate alege din nou.
+         */
+        fun decideShare(
+            active: Boolean,
+            fromPartner: Boolean,
+            licenseId: String?,
+            boundLicenseId: String?,
+            boundPhone: String?,
+            partnerPhone: String,
+        ): ShareDecision {
+            if (!active) return ShareDecision.NO_LICENSE
+            if (fromPartner) return ShareDecision.NOT_OWNER
+            if (boundPhone.isNullOrEmpty() || boundLicenseId != licenseId) return ShareDecision.SEND
+            return if (Phones.sameNumber(boundPhone, partnerPhone)) ShareDecision.SEND
+                   else ShareDecision.OTHER_PARTNER
+        }
+
         fun decideAdoption(
             current: LicenseCheck?,
             currentBusinessId: String,

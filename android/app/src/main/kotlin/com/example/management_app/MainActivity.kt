@@ -276,7 +276,15 @@ class MainActivity : FlutterActivity() {
                     "getBusinessId" -> result.success(LicenseStore.getOrCreateBusinessId(this))
                     "checkLicense" -> result.success(LicenseStore.check(this).toMap(null))
                     "pickLicenseFile" -> pickLicenseFile(result)
-                    "getShareableLicense" -> result.success(LicenseStore.shareableLicense(this))
+                    // Trimite licența partenerului unui tabel, dacă are voie:
+                    // "sent" | "no_license" | "not_owner" | "other_partner" |
+                    // "no_partner" (fără partener sau cod de împerechere).
+                    "shareLicenseWithBoard" -> {
+                        val boardId = call.argument<String>("boardId")
+                            ?: run { result.error("ARG", "missing boardId", null); return@setMethodCallHandler }
+                        result.success(shareLicenseWithBoard(boardId))
+                    }
+                    "getLicenseShareInfo" -> result.success(LicenseStore.shareInfo(this))
                     "consumePartnerNotice" -> result.success(LicenseStore.consumePartnerNotice(this))
 
                     else -> result.notImplemented()
@@ -337,6 +345,24 @@ class MainActivity : FlutterActivity() {
         } catch (e: Exception) {
             Pair(false, "Eroare la verificare: ${e.message}")
         }
+    }
+
+    private fun shareLicenseWithBoard(boardId: String): String {
+        val prefs = getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+        val phone = prefs.getString("flutter.sync_partner_phone_$boardId", null)?.trim().orEmpty()
+        if (phone.isEmpty() || !SyncAuth.isValidCode(prefs.getString(SmsSyncReceiver.secretKey(boardId), null))) {
+            return "no_partner"
+        }
+        val (decision, license) = LicenseStore.shareTo(this, phone)
+        if (license == null) {
+            return when (decision) {
+                ShareDecision.NOT_OWNER -> "not_owner"
+                ShareDecision.OTHER_PARTNER -> "other_partner"
+                else -> "no_license"
+            }
+        }
+        SmsSyncReceiver.sendSigned(this, boardId, SmsSyncReceiver.LICENSE_PREFIX + license)
+        return "sent"
     }
 
     // ── Flux nou de licențiere (identic ca format cu Fidelio) ────────────────────

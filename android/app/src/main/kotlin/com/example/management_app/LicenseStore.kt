@@ -26,6 +26,14 @@ object LicenseStore {
     // Setat când licența a fost preluată/reînnoită de la telefonul partener,
     // ca Flutter să poată anunța utilizatorul la următoarea verificare.
     private const val KEY_PARTNER_NOTICE = "license_partner_notice"
+    // De unde vine licența: SOURCE_FILE (importată aici din fișier / backup)
+    // sau SOURCE_PARTNER (primită prin SMS) — doar prima poate fi trimisă.
+    const val KEY_LICENSE_SOURCE = "license_source"
+    const val SOURCE_FILE = "file"
+    const val SOURCE_PARTNER = "partner"
+    // Partenerul căruia i-a fost trimisă licența, și pentru care licență.
+    const val KEY_SHARE_PARTNER = "license_share_partner"
+    const val KEY_SHARE_LICENSE_ID = "license_share_license_id"
 
     // Cheia publică RSA-2048 (DER/X.509, base64) — corespunde tools/private.pem
     const val PUBLIC_KEY_B64 =
@@ -37,11 +45,17 @@ object LicenseStore {
         "yx23dfww5NNWiI4fRp/PyFMS1lvqprQZf8gLWXqnKmmih+2kTNE6ukHcO7pjfKBD" +
         "UwIDAQAB"
 
-    private val verifier by lazy {
+    private val productionVerifier by lazy {
         LicenseVerifier(Base64.decode(PUBLIC_KEY_B64, Base64.DEFAULT)) {
             Base64.decode(it, Base64.DEFAULT)
         }
     }
+
+    // Doar testele îl înlocuiesc (licențele de test sunt semnate cu altă cheie).
+    @Volatile
+    internal var verifierOverride: LicenseVerifier? = null
+
+    private val verifier: LicenseVerifier get() = verifierOverride ?: productionVerifier
 
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -96,20 +110,55 @@ object LicenseStore {
     fun importLicense(context: Context, content: String): LicenseCheck {
         val result = verifier.evaluate(content, getOrCreateBusinessId(context), effectiveNow(context))
         if (result.isActive) {
-            prefs(context).edit().putString(KEY_LICENSE_JSON, content).apply()
+            prefs(context).edit()
+                .putString(KEY_LICENSE_JSON, content)
+                .putString(KEY_LICENSE_SOURCE, SOURCE_FILE)
+                .apply()
         }
         return result
     }
 
     /**
-     * Licența de trimis telefonului partener — doar dacă e activă. Compactată
-     * (fără spații/linii noi) ca SMS-ul să aibă cât mai puține segmente;
-     * semnătura acoperă câmpurile canonice, nu textul JSON, deci rămâne validă.
+     * Licența de trimis telefonului [partnerPhone], dacă are voie (vezi
+     * LicenseVerifier.decideShare). La SEND partenerul rămâne legat de
+     * licență. Licența e compactată (fără spații/linii noi) ca SMS-ul să aibă
+     * cât mai puține segmente; semnătura acoperă câmpurile canonice, nu
+     * textul JSON, deci rămâne validă.
      */
-    fun shareableLicense(context: Context): String? {
-        if (!check(context).isActive) return null
-        val content = storedLicense(context) ?: return null
-        return try { JSONObject(content).toString() } catch (_: Exception) { null }
+    fun shareTo(context: Context, partnerPhone: String): Pair<ShareDecision, String?> {
+        val current = check(context)
+        val prefs = prefs(context)
+        val decision = LicenseVerifier.decideShare(
+            active = current.isActive,
+            fromPartner = prefs.getString(KEY_LICENSE_SOURCE, SOURCE_FILE) == SOURCE_PARTNER,
+            licenseId = current.licenseId,
+            boundLicenseId = prefs.getString(KEY_SHARE_LICENSE_ID, null),
+            boundPhone = prefs.getString(KEY_SHARE_PARTNER, null),
+            partnerPhone = partnerPhone,
+        )
+        if (decision != ShareDecision.SEND) return decision to null
+        val compact = try {
+            JSONObject(storedLicense(context) ?: return ShareDecision.NO_LICENSE to null).toString()
+        } catch (_: Exception) {
+            return ShareDecision.NO_LICENSE to null
+        }
+        prefs.edit()
+            .putString(KEY_SHARE_PARTNER, Phones.digitsOnly(partnerPhone))
+            .putString(KEY_SHARE_LICENSE_ID, current.licenseId)
+            .commit()
+        return decision to compact
+    }
+
+    /** Pentru ecranul de licență: de unde vine licența și cui a fost trimisă. */
+    fun shareInfo(context: Context): HashMap<String, Any?> {
+        val prefs = prefs(context)
+        val current = check(context)
+        val bound = prefs.getString(KEY_SHARE_PARTNER, null)
+            ?.takeIf { prefs.getString(KEY_SHARE_LICENSE_ID, null) == current.licenseId }
+        return hashMapOf(
+            "fromPartner" to (prefs.getString(KEY_LICENSE_SOURCE, SOURCE_FILE) == SOURCE_PARTNER),
+            "sharedWith" to bound?.let { Diag.mask(it) },
+        )
     }
 
     /** Licență primită prin SMS de la partenerul de sincronizare. */
@@ -123,6 +172,7 @@ object LicenseStore {
             prefs(context).edit()
                 .putString(KEY_BUSINESS_ID, incoming.businessId)
                 .putString(KEY_LICENSE_JSON, content)
+                .putString(KEY_LICENSE_SOURCE, SOURCE_PARTNER)
                 .putBoolean(KEY_PARTNER_NOTICE, true)
                 .commit()
         }
@@ -130,8 +180,16 @@ object LicenseStore {
     }
 
     // ── Backup / restore ─────────────────────────────────────────────────────────
-    fun identity(context: Context): BackupFormat.Identity =
-        BackupFormat.Identity(getOrCreateBusinessId(context), storedLicense(context))
+    fun identity(context: Context): BackupFormat.Identity {
+        val prefs = prefs(context)
+        return BackupFormat.Identity(
+            businessId = getOrCreateBusinessId(context),
+            licenseJson = storedLicense(context),
+            licenseSource = prefs.getString(KEY_LICENSE_SOURCE, null),
+            sharePartner = prefs.getString(KEY_SHARE_PARTNER, null),
+            shareLicenseId = prefs.getString(KEY_SHARE_LICENSE_ID, null),
+        )
+    }
 
     /** True dacă [licenseJson] e o licență activă emisă pe [businessId]. */
     fun isActiveFor(context: Context, licenseJson: String?, businessId: String?): Boolean {
@@ -158,6 +216,15 @@ object LicenseStore {
         } else {
             editor.remove(KEY_LICENSE_JSON)
         }
+        // Proveniența și partenerul legat vin cu licența — altfel backup-ul
+        // telefonului partener, restaurat pe un telefon nou, ar putea trimite
+        // licența unui al treilea telefon.
+        fun putOrRemove(key: String, value: String?) {
+            if (value != null) editor.putString(key, value) else editor.remove(key)
+        }
+        putOrRemove(KEY_LICENSE_SOURCE, identity.licenseSource)
+        putOrRemove(KEY_SHARE_PARTNER, identity.sharePartner)
+        putOrRemove(KEY_SHARE_LICENSE_ID, identity.shareLicenseId)
         // URI-ul vechi ar reintroduce, prin migrare, licența altei identități.
         editor.remove(KEY_LICENSE_URI).commit()
         return true

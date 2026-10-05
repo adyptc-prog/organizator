@@ -206,9 +206,10 @@ class SmsSyncReceiver : BroadcastReceiver() {
             return
         }
         if (body.startsWith(LICENSE_REQUEST_PREFIX)) {
-            LicenseStore.shareableLicense(context)?.let {
-                sendSigned(context, boardId, LICENSE_PREFIX + it)
-            }
+            // Doar telefonul care a importat licența, și doar partenerului ei.
+            val (decision, license) = LicenseStore.shareTo(context, sender)
+            Diag.i("license request from partner: $decision")
+            if (license != null) sendSigned(context, boardId, LICENSE_PREFIX + license)
             return
         }
 

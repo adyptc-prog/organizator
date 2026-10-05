@@ -152,4 +152,18 @@ class LicenseVerifierTest {
         assertEquals(AdoptionDecision.RENEW,
             LicenseVerifier.decideAdoption(invalid, ownId, check("timed")))
     }
+
+    @Test
+    fun `licenta se imparte doar cu un partener, doar de telefonul proprietar`() {
+        fun share(fromPartner: Boolean = false, boundId: String? = null, bound: String? = null, to: String = "0722000111", active: Boolean = true) =
+            LicenseVerifier.decideShare(active, fromPartner, "L1", boundId, bound, to)
+
+        assertEquals(ShareDecision.NO_LICENSE, share(active = false))
+        assertEquals(ShareDecision.NOT_OWNER, share(fromPartner = true))
+        assertEquals(ShareDecision.SEND, share())
+        assertEquals(ShareDecision.SEND, share(boundId = "L1", bound = "40722000111"))
+        assertEquals(ShareDecision.OTHER_PARTNER, share(boundId = "L1", bound = "40722000111", to = "0733000222"))
+        // Licență nouă: legătura veche nu mai contează.
+        assertEquals(ShareDecision.SEND, share(boundId = "L0", bound = "40722000111", to = "0733000222"))
+    }
 }
