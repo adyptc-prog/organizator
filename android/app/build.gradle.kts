@@ -46,6 +46,11 @@ android {
         }
     }
 
+    testOptions {
+        // Robolectric: testele JVM rulează receiverele și SharedPreferences reale.
+        unitTests.isIncludeAndroidResources = true
+    }
+
     buildTypes {
         release {
             val releaseConfig = signingConfigs.getByName("release")
@@ -67,4 +72,6 @@ dependencies {
     // android.jar conține doar stub-uri pentru org.json — testele JVM au
     // nevoie de implementarea reală.
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.15.1")
+    testImplementation("androidx.test:core:1.6.1")
 }

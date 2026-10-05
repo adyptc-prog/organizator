@@ -18,8 +18,10 @@ import org.json.JSONObject
 class ValidationDeadlineReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        val alarmId = intent.getIntExtra("validation_alarm_id", -1)
-        if (alarmId < 0) return
+        // ID-ul e String.hashCode() al syncId-ului — negativ în ~jumătate din
+        // cazuri, deci nu se poate folosi -1 ca „lipsă”.
+        if (!intent.hasExtra("validation_alarm_id")) return
+        val alarmId = intent.getIntExtra("validation_alarm_id", 0)
 
         val pending = goAsync()
         val appContext = context.applicationContext
