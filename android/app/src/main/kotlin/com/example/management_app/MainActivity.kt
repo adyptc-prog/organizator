@@ -204,20 +204,11 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
-                    "getSyncMessages" -> {
-                        val prefs = getSharedPreferences(
-                            SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE
-                        )
-                        result.success(
-                            prefs.getString(SmsSyncReceiver.QUEUE_KEY, "[]") ?: "[]"
-                        )
-                    }
+                    "getSyncMessages" -> result.success(SmsSyncReceiver.snapshot(this))
 
-                    "clearSyncQueue" -> {
-                        getSharedPreferences(SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE)
-                            .edit()
-                            .putString(SmsSyncReceiver.QUEUE_KEY, "[]")
-                            .apply()
+                    "ackSyncMessages" -> {
+                        val ids = call.argument<List<String>>("ids") ?: emptyList()
+                        SmsSyncReceiver.acknowledge(this, ids)
                         result.success(null)
                     }
 

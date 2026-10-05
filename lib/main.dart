@@ -517,7 +517,8 @@ class SyncService {
   // Fiecare mesaj din coadă e etichetat de partea nativă cu tabelul al cărui
   // partener configurat corespunde expeditorului SMS-ului (boardId poate fi
   // gol dacă a fost primit înainte ca migrarea pe mai multe tabele să ruleze
-  // — în acel caz se consideră primul tabel).
+  // — în acel caz se consideră primul tabel). Fiecare intrare are un id,
+  // folosit la confirmare (ackMessages).
   static Future<List<SyncQueueEntry>> getPendingMessages() async {
     if (!isSupported) return [];
     try {
@@ -526,13 +527,11 @@ class SyncService {
       if (decoded is! List) return [];
       return decoded
           .map<SyncQueueEntry?>((e) {
-            if (e is Map) {
-              final msg = e['msg'] as String?;
-              if (msg == null || msg.isEmpty) return null;
-              return (boardId: (e['board'] as String?) ?? '', msg: msg);
-            }
-            if (e is String && e.isNotEmpty) return (boardId: '', msg: e);
-            return null;
+            if (e is! Map) return null;
+            final id = e['id'] as String?;
+            final msg = e['msg'] as String?;
+            if (id == null || id.isEmpty) return null;
+            return (id: id, boardId: (e['board'] as String?) ?? '', msg: msg ?? '');
           })
           .whereType<SyncQueueEntry>()
           .toList();
@@ -541,10 +540,12 @@ class SyncService {
     }
   }
 
-  static Future<void> clearQueue() async {
-    if (!isSupported) return;
+  // Scoate din coadă doar intrările procesate — nu și pe cele sosite între
+  // timp (golirea completă a cozii le pierdea).
+  static Future<void> ackMessages(List<String> ids) async {
+    if (!isSupported || ids.isEmpty) return;
     try {
-      await _ch.invokeMethod<void>('clearSyncQueue');
+      await _ch.invokeMethod<void>('ackSyncMessages', {'ids': ids});
     } catch (_) {}
   }
 }
@@ -715,7 +716,7 @@ class DeletedItem {
       );
 }
 
-typedef SyncQueueEntry = ({String boardId, String msg});
+typedef SyncQueueEntry = ({String id, String boardId, String msg});
 
 typedef ReportEntry = ({Item item, DateTime? deletedAt});
 
@@ -1336,24 +1337,35 @@ class _ManagementPageState extends State<ManagementPage>
   // Fiecare tabel are propriul partener SMS, deci mesajele din coadă pot
   // aparține unui tabel diferit de cel activ (etichetate de SmsSyncReceiver
   // cu tabelul al cărui partener configurat corespunde expeditorului).
+  // Rulează din mai multe locuri (timer, revenire în aplicație, schimbare de
+  // tabel) — o a doua procesare simultană ar aplica aceleași mesaje de două
+  // ori peste aceeași listă în memorie.
+  bool _syncQueueBusy = false;
+
   Future<void> _processSyncQueue() async {
-    if (_loading) return;
-    final entries = await SyncService.getPendingMessages();
-    if (entries.isEmpty) return;
+    if (_loading || _syncQueueBusy) return;
+    _syncQueueBusy = true;
+    try {
+      final entries = await SyncService.getPendingMessages();
+      if (entries.isEmpty) return;
 
-    final byBoard = <String, List<String>>{};
-    for (final e in entries) {
-      final boardId = e.boardId.isEmpty ? 'b1' : e.boardId;
-      byBoard.putIfAbsent(boardId, () => []).add(e.msg);
+      final byBoard = <String, List<String>>{};
+      for (final e in entries) {
+        if (e.msg.isEmpty) continue;
+        final boardId = e.boardId.isEmpty ? 'b1' : e.boardId;
+        byBoard.putIfAbsent(boardId, () => []).add(e.msg);
+      }
+
+      for (final entry in byBoard.entries) {
+        final boardIndex = _boards.indexWhere((b) => b.id == entry.key);
+        if (boardIndex == -1) continue; // tabel necunoscut — ignorat
+        await _mergeSyncMessages(entry.key, boardIndex, entry.value);
+      }
+
+      await SyncService.ackMessages([for (final e in entries) e.id]);
+    } finally {
+      _syncQueueBusy = false;
     }
-
-    for (final entry in byBoard.entries) {
-      final boardIndex = _boards.indexWhere((b) => b.id == entry.key);
-      if (boardIndex == -1) continue; // tabel necunoscut — ignorat
-      await _mergeSyncMessages(entry.key, boardIndex, entry.value);
-    }
-
-    await SyncService.clearQueue();
   }
 
   // Aplică mesajele de sincronizare peste tabelul indicat. Dacă e tabelul

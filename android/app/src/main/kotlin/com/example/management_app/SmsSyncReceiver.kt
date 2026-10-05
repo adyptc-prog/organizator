@@ -17,7 +17,7 @@ import org.json.JSONObject
  * expeditorului.
  *
  * Flutter citește coada la pornire și la revenire în foreground via
- * MethodChannel "organizator/sms" → getSyncMessages / clearSyncQueue.
+ * MethodChannel "organizator/sms" → getSyncMessages / ackSyncMessages.
  */
 class SmsSyncReceiver : BroadcastReceiver() {
 
@@ -41,18 +41,73 @@ class SmsSyncReceiver : BroadcastReceiver() {
         // care trebuie să adauge/actualizeze/șteargă o înregistrare (bot de
         // rezervări, expirare automată de validare etc.), fără să dubleze
         // logica de acces la SharedPreferences în fiecare loc.
+        // Fiecare intrare are un „id” unic, ca Flutter să confirme (și să
+        // scoată din coadă) exact intrările procesate — nu și pe cele sosite
+        // între timp.
         fun enqueue(context: Context, boardId: String, msg: String) {
             synchronized(QUEUE_LOCK) {
-                val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                val existing = prefs.getString(QUEUE_KEY, "[]") ?: "[]"
-                val arr = JSONArray(existing)
-                val entry = JSONObject()
-                entry.put("board", boardId)
-                entry.put("msg", msg)
-                arr.put(entry)
-                prefs.edit().putString(QUEUE_KEY, arr.toString()).apply()
+                val prefs = queuePrefs(context)
+                val arr = readQueue(prefs)
+                arr.put(JSONObject().put("id", newEntryId()).put("board", boardId).put("msg", msg))
+                prefs.edit().putString(QUEUE_KEY, arr.toString()).commit()
             }
         }
+
+        /**
+         * Coada, ca JSON, pentru Flutter. Intrările vechi (fără id, sau scrise
+         * ca text simplu de versiuni anterioare) primesc acum un id, salvat,
+         * ca să poată fi confirmate la fel ca restul.
+         */
+        fun snapshot(context: Context): String = synchronized(QUEUE_LOCK) {
+            val prefs = queuePrefs(context)
+            val arr = readQueue(prefs)
+            var changed = false
+            val normalized = JSONArray()
+            for (i in 0 until arr.length()) {
+                val raw = arr.opt(i)
+                val entry = when (raw) {
+                    is JSONObject -> raw
+                    is String -> JSONObject().put("board", "").put("msg", raw).also { changed = true }
+                    else -> { changed = true; continue }
+                }
+                if (entry.optString("id").isEmpty()) {
+                    entry.put("id", newEntryId())
+                    changed = true
+                }
+                normalized.put(entry)
+            }
+            if (changed) prefs.edit().putString(QUEUE_KEY, normalized.toString()).commit()
+            normalized.toString()
+        }
+
+        /** Scoate din coadă doar intrările procesate de Flutter. */
+        fun acknowledge(context: Context, ids: Collection<String>) {
+            if (ids.isEmpty()) return
+            val done = ids.toSet()
+            synchronized(QUEUE_LOCK) {
+                val prefs = queuePrefs(context)
+                val arr = readQueue(prefs)
+                val remaining = JSONArray()
+                for (i in 0 until arr.length()) {
+                    val entry = arr.optJSONObject(i)
+                    if (entry != null && entry.optString("id") in done) continue
+                    remaining.put(arr.opt(i))
+                }
+                prefs.edit().putString(QUEUE_KEY, remaining.toString()).commit()
+            }
+        }
+
+        private fun queuePrefs(context: Context): SharedPreferences =
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        // JSON corupt = coadă goală, nu excepție (altfel nimic nu mai intră).
+        private fun readQueue(prefs: SharedPreferences): JSONArray = try {
+            JSONArray(prefs.getString(QUEUE_KEY, "[]") ?: "[]")
+        } catch (_: Exception) {
+            JSONArray()
+        }
+
+        private fun newEntryId(): String = java.util.UUID.randomUUID().toString()
     }
 
     // Păstrăm doar cifrele, ca să comparăm numere indiferent de format
@@ -107,8 +162,6 @@ class SmsSyncReceiver : BroadcastReceiver() {
             bySender.getOrPut(sender) { StringBuilder() }.append(body)
         }
 
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-
         for ((sender, sb) in bySender) {
             val body = sb.toString()
             if (!body.startsWith(SYNC_PREFIX)) continue
@@ -133,19 +186,7 @@ class SmsSyncReceiver : BroadcastReceiver() {
                 continue
             }
 
-            try {
-                synchronized(QUEUE_LOCK) {
-                    val existing = prefs.getString(QUEUE_KEY, "[]") ?: "[]"
-                    val arr = JSONArray(existing)
-                    val entry = JSONObject()
-                    entry.put("board", boardId)
-                    entry.put("msg", body)
-                    arr.put(entry)
-                    prefs.edit().putString(QUEUE_KEY, arr.toString()).apply()
-                }
-            } catch (_: Exception) {
-                // JSON corupt — ignorat
-            }
+            enqueue(context, boardId, body)
         }
     }
 
