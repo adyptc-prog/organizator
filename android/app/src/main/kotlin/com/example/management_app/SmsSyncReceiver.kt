@@ -37,6 +37,9 @@ class SmsSyncReceiver : BroadcastReceiver() {
         // ClientBookingReceiver (rezervări de la clienți) pot scrie simultan.
         val QUEUE_LOCK = Any()
 
+        const val ORIGIN_LOCAL   = "local"
+        const val ORIGIN_PARTNER = "partner"
+
         // Scrie un mesaj în coada de sincronizare — folosit de orice cod nativ
         // care trebuie să adauge/actualizeze/șteargă o înregistrare (bot de
         // rezervări, expirare automată de validare etc.), fără să dubleze
@@ -44,11 +47,19 @@ class SmsSyncReceiver : BroadcastReceiver() {
         // Fiecare intrare are un „id” unic, ca Flutter să confirme (și să
         // scoată din coadă) exact intrările procesate — nu și pe cele sosite
         // între timp.
-        fun enqueue(context: Context, boardId: String, msg: String) {
+        //
+        // „origin” spune de unde vine schimbarea: ORIGIN_LOCAL (botul de
+        // rezervări, anularea automată la 24h — trebuie trimisă și
+        // partenerului) sau ORIGIN_PARTNER (a venit chiar de la partener — nu
+        // se retrimite, altfel mesajele s-ar plimba la nesfârșit).
+        fun enqueue(context: Context, boardId: String, msg: String, origin: String = ORIGIN_LOCAL) {
             synchronized(QUEUE_LOCK) {
                 val prefs = queuePrefs(context)
                 val arr = readQueue(prefs)
-                arr.put(JSONObject().put("id", newEntryId()).put("board", boardId).put("msg", msg))
+                arr.put(
+                    JSONObject().put("id", newEntryId()).put("board", boardId)
+                        .put("msg", msg).put("origin", origin)
+                )
                 prefs.edit().putString(QUEUE_KEY, arr.toString()).commit()
             }
         }
@@ -186,7 +197,7 @@ class SmsSyncReceiver : BroadcastReceiver() {
                 continue
             }
 
-            enqueue(context, boardId, body)
+            enqueue(context, boardId, body, ORIGIN_PARTNER)
         }
     }
 

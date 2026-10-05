@@ -21,8 +21,14 @@ class _FakeNativeQueue {
   // în timpul procesării.
   void Function()? afterRead;
 
-  void add(String board, String msg) =>
-      entries.add({'id': 'e${nextId++}', 'board': board, 'msg': msg});
+  final sent = <Map<String, String>>[];
+
+  void add(String board, String msg, {String? origin}) => entries.add({
+        'id': 'e${nextId++}',
+        'board': board,
+        'msg': msg,
+        'origin': ?origin,
+      });
 
   Future<Object?> handle(MethodCall call) async {
     switch (call.method) {
@@ -33,6 +39,12 @@ class _FakeNativeQueue {
         afterRead?.call();
         afterRead = null;
         return snapshot;
+      case 'sendSms':
+        sent.add({
+          'phone': call.arguments['phone'] as String,
+          'message': call.arguments['message'] as String,
+        });
+        return null;
       case 'ackSyncMessages':
         final ids = (call.arguments['ids'] as List).cast<String>();
         acked.add(ids);
@@ -61,6 +73,9 @@ void main() {
       ]),
       'management_active_board': 'b1',
       'management_items_b1': '[]',
+      'management_items_b2': '[]',
+      'sync_partner_phone_b1': '0744444444',
+      'sync_partner_phone_b2': '0755555555',
     });
     debugSimulateAndroid = true;
     queue = _FakeNativeQueue();
@@ -124,5 +139,32 @@ void main() {
 
     await settle(tester);
     expect(find.text('Rezervare A'), findsOneWidget);
+  });
+
+  testWidgets('rezervarea făcută de bot e trimisă și partenerului tabelului',
+      (tester) async {
+    queue.add('b2', _add('aaaa', 'Rezervare bot'), origin: 'local');
+    queue.add('b2', 'ORG:D:zzzz', origin: 'local');
+
+    await tester.pumpWidget(const ManagementApp());
+    await settle(tester);
+
+    expect(queue.sent, [
+      {'phone': '0755555555', 'message': _add('aaaa', 'Rezervare bot')},
+      {'phone': '0755555555', 'message': 'ORG:D:zzzz'},
+    ]);
+  });
+
+  testWidgets('mesajele venite de la partener nu sunt retrimise',
+      (tester) async {
+    queue.add('b1', _add('aaaa', 'De la partener'), origin: 'partner');
+    // Intrare scrisă de o versiune veche (fără origin) — tot de la partener.
+    queue.add('b1', _add('bbbb', 'Veche'));
+
+    await tester.pumpWidget(const ManagementApp());
+    await settle(tester);
+
+    expect(find.text('De la partener'), findsOneWidget);
+    expect(queue.sent, isEmpty);
   });
 }

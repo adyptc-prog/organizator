@@ -83,4 +83,13 @@ class SyncQueueTest {
         SmsSyncReceiver.acknowledge(context, listOf("necunoscut"))
         assertTrue(msgs(SmsSyncReceiver.snapshot(context)).contains("ORG:D:z"))
     }
+
+    @Test
+    fun `schimbarile native sunt marcate locale, cele de la partener nu`() {
+        SmsSyncReceiver.enqueue(context, "b1", "ORG:D:bot")
+        SmsSyncReceiver.enqueue(context, "b1", "ORG:D:p", SmsSyncReceiver.ORIGIN_PARTNER)
+        val arr = JSONArray(SmsSyncReceiver.snapshot(context))
+        assertEquals("local", arr.getJSONObject(0).getString("origin"))
+        assertEquals("partner", arr.getJSONObject(1).getString("origin"))
+    }
 }

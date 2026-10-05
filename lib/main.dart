@@ -537,13 +537,32 @@ class SyncService {
             final id = e['id'] as String?;
             final msg = e['msg'] as String?;
             if (id == null || id.isEmpty) return null;
-            return (id: id, boardId: (e['board'] as String?) ?? '', msg: msg ?? '');
+            return (
+              id: id,
+              boardId: (e['board'] as String?) ?? '',
+              msg: msg ?? '',
+              // Intrările scrise de versiuni vechi nu au „origin” — le
+              // tratăm ca venite de la partener (nu le retrimitem).
+              fromPartner: e['origin'] != 'local',
+            );
           })
           .whereType<SyncQueueEntry>()
           .toList();
     } catch (_) {
       return [];
     }
+  }
+
+  // Trimite partenerului unui anumit tabel (nu neapărat cel activ) — pentru
+  // schimbările făcute nativ, cu aplicația închisă, pe orice tabel.
+  static Future<void> sendToBoardPartner(String boardId, String msg) async {
+    if (!isSupported) return;
+    final prefs = await SharedPreferences.getInstance();
+    final phone = prefs.getString(_syncPartnerKeyFor(boardId))?.trim() ?? '';
+    if (phone.isEmpty) return;
+    try {
+      await _ch.invokeMethod<void>('sendSms', {'phone': phone, 'message': msg});
+    } catch (_) {}
   }
 
   // Scoate din coadă doar intrările procesate — nu și pe cele sosite între
@@ -722,7 +741,10 @@ class DeletedItem {
       );
 }
 
-typedef SyncQueueEntry = ({String id, String boardId, String msg});
+// fromPartner: mesajul a venit de la partenerul de sincronizare (nu se
+// retrimite). Altfel e o schimbare locală făcută nativ (botul de rezervări,
+// anularea automată) pe care partenerul trebuie s-o primească.
+typedef SyncQueueEntry = ({String id, String boardId, String msg, bool fromPartner});
 
 typedef ReportEntry = ({Item item, DateTime? deletedAt});
 
@@ -1366,6 +1388,16 @@ class _ManagementPageState extends State<ManagementPage>
         final boardIndex = _boards.indexWhere((b) => b.id == entry.key);
         if (boardIndex == -1) continue; // tabel necunoscut — ignorat
         await _mergeSyncMessages(entry.key, boardIndex, entry.value);
+      }
+
+      // Rezervările/anulările făcute de bot (și anularea automată la 24h)
+      // ajung doar în coada acestui telefon — le trimitem și partenerului,
+      // altfel tabelul de pe celălalt telefon nu le vede niciodată.
+      for (final e in entries) {
+        if (e.fromPartner || e.msg.isEmpty) continue;
+        final boardId = e.boardId.isEmpty ? 'b1' : e.boardId;
+        if (!_boards.any((b) => b.id == boardId)) continue;
+        await SyncService.sendToBoardPartner(boardId, e.msg);
       }
 
       await SyncService.ackMessages([for (final e in entries) e.id]);
