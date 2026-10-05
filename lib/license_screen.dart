@@ -119,14 +119,6 @@ class _LicenseScreenState extends State<LicenseScreen> {
         ].join(' · '),
       );
     }
-    if (LicenseService.isLegacyLicensed) {
-      return (
-        icon: Icons.verified_user,
-        color: Colors.green.shade700,
-        title: 'Licență activă (cod .orgtoken)',
-        subtitle: 'Activată cu un cod Volt Academy.',
-      );
-    }
     final invalidNote = LicenseService.newLicenseStatus == 'invalid' &&
             LicenseService.newLicenseMessage.isNotEmpty
         ? '\nLicență respinsă: ${LicenseService.newLicenseMessage}'

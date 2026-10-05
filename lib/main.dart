@@ -1168,7 +1168,6 @@ class _ManagementPageState extends State<ManagementPage>
     await LicenseService.load();
     await _loadItems();
     await _processSyncQueue();
-    await _checkPendingLicense();
     await _checkLicenseFromPartner();
     await _warnLicenseExpiry();
   }
@@ -1306,7 +1305,6 @@ class _ManagementPageState extends State<ManagementPage>
         _startColorTimer();
         _startSyncQueueTimer();
         _processSyncQueue();
-        _checkPendingLicense();
         _refreshLicense();
         _checkSmsPermission();
         _checkSmsFailure();
@@ -1588,57 +1586,6 @@ class _ManagementPageState extends State<ManagementPage>
     }
   }
 
-  // ── Activare licență prin fișier .orgtoken ───────────────────────────────────
-  Future<void> _checkPendingLicense() async {
-    if (LicenseService.isLicensed) return;
-    final token = await LicenseService.getPendingToken();
-    if (token != null && mounted) {
-      await _showActivationDialog(token);
-    }
-  }
-
-  Future<void> _showActivationDialog(String tokenJson) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Row(children: [
-          Icon(Icons.vpn_key, color: Color(0xFF1E1B4B)),
-          SizedBox(width: 8),
-          Text('Activare Licență'),
-        ]),
-        content: const Text(
-          'A fost detectat un fișier de licență Organizator.\n\n'
-          'Doriți să activați aplicația acum?',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Anulează'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Activează'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed != true || !mounted) return;
-
-    final r = await LicenseService.activate(tokenJson);
-    if (!mounted) return;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(r.message),
-        backgroundColor: r.success ? Colors.green.shade700 : Colors.red.shade700,
-        duration: const Duration(seconds: 4),
-      ),
-    );
-    if (r.success) setState(() {});
-  }
-
   Future<void> _openBackupScreen() async {
     await Navigator.of(context).push(MaterialPageRoute<void>(
       builder: (_) => BackupScreen(
@@ -1802,14 +1749,6 @@ class _ManagementPageState extends State<ManagementPage>
                     unawaited(_shareLicenseWithPartners());
                   }
                 },
-              ),
-              const SizedBox(height: 16),
-              const Divider(),
-              const SizedBox(height: 8),
-              const Text(
-                'Ai deja un fișier .orgtoken vechi de la Volt Academy?\n'
-                'Deschide-l din WhatsApp sau Files și alege "Organizator".',
-                style: TextStyle(fontSize: 11, color: Colors.grey),
               ),
             ],
           ),

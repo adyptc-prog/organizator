@@ -22,13 +22,11 @@ class LicenseService {
   static bool? debugIsAndroid;
   static bool get _isAndroid => debugIsAndroid ?? Platform.isAndroid;
 
-  // Fluxul vechi .orgtoken — permanent, fără expirare.
-  static bool      _legacyLicensed = false;
   static DateTime? _trialStart;
 
-  // Fluxul nou: licență cu businessId + expirare, cumpărată de pe site
-  // (identic ca format cu Fidelio). Rulează alături de vechiul flux .orgtoken,
-  // fără să-l înlocuiască — orice cod vechi deja emis rămâne valabil.
+  // Licență cu businessId + expirare, cumpărată de pe site (identic ca
+  // format cu Fidelio). Fluxul vechi .orgtoken (permanent, nelegat de
+  // telefon) a fost eliminat.
   static String  newLicenseStatus = 'missing';
   static String  newLicenseMessage = '';
   static String? newLicenseValidUntil;
@@ -36,11 +34,10 @@ class LicenseService {
   static bool    newLicenseIsLifetime = false;
 
   static bool get isNewLicenseActive => newLicenseStatus == 'active';
-  static bool get isLegacyLicensed => _legacyLicensed;
 
   // Non-Android: nelimitat
   static bool get isLicensed =>
-      !_isAndroid || _legacyLicensed || isNewLicenseActive;
+      !_isAndroid || isNewLicenseActive;
 
   static bool get isExpiringSoon =>
       isNewLicenseActive &&
@@ -68,9 +65,6 @@ class LicenseService {
 
   static Future<void> load() async {
     if (!_isAndroid) return;
-    try {
-      _legacyLicensed = await _ch.invokeMethod<bool>('isLicensed') ?? false;
-    } catch (_) {}
     await checkNewLicense();
     // Înregistrăm data primei instalări (trial start)
     final prefs = await SharedPreferences.getInstance();
@@ -80,15 +74,6 @@ class LicenseService {
       await prefs.setString(_kTrialStartKey, _trialStart!.toIso8601String());
     } else {
       _trialStart = DateTime.tryParse(saved);
-    }
-  }
-
-  static Future<String?> getPendingToken() async {
-    if (!_isAndroid) return null;
-    try {
-      return await _ch.invokeMethod<String?>('getPendingToken');
-    } catch (_) {
-      return null;
     }
   }
 
@@ -184,26 +169,9 @@ class LicenseService {
     return true;
   }
 
-  static Future<({bool success, String message})> activate(String token) async {
-    if (!_isAndroid) {
-      return (success: false, message: 'Nu este suportat pe această platformă.');
-    }
-    try {
-      final r = await _ch.invokeMethod<Map<Object?, Object?>>('verifyAndActivate',
-          {'token': token});
-      final success = (r?['success'] as bool?) ?? false;
-      final msg     = (r?['msg']     as String?) ?? '';
-      if (success) _legacyLicensed = true;
-      return (success: success, message: msg);
-    } catch (e) {
-      return (success: false, message: e.toString());
-    }
-  }
-
   @visibleForTesting
   static void debugReset() {
     debugIsAndroid = null;
-    _legacyLicensed = false;
     _trialStart = null;
     _apply(null);
   }

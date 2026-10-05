@@ -4,15 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.provider.DocumentsContract
-import android.util.Base64
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import org.json.JSONArray
 import org.json.JSONObject
-import java.security.KeyFactory
-import java.security.Signature
-import java.security.spec.X509EncodedKeySpec
 
 class MainActivity : FlutterActivity() {
 
@@ -24,9 +20,6 @@ class MainActivity : FlutterActivity() {
         private const val PICK_BACKUP_FOLDER_REQUEST_CODE = 8022
         private const val PICK_RESTORE_BACKUP_REQUEST_CODE = 8023
     }
-
-    // Token .orgtoken primit prin intent, așteptând ca Flutter să fie gata
-    private var pendingLicenseToken: String? = null
 
     // Fluxul nou de licențiere (businessId + expirare, format identic cu Fidelio)
     private var pendingLicensePickResult: MethodChannel.Result? = null
@@ -40,17 +33,6 @@ class MainActivity : FlutterActivity() {
     private var lastPickedRestoreUri: android.net.Uri? = null
 
     // ── Lifecycle ────────────────────────────────────────────────────────────────
-    override fun onCreate(savedInstanceState: android.os.Bundle?) {
-        super.onCreate(savedInstanceState)
-        extractTokenFromIntent(intent)
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        extractTokenFromIntent(intent)
-    }
-
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         when (requestCode) {
@@ -75,20 +57,6 @@ class MainActivity : FlutterActivity() {
         } catch (error: Exception) {
             result.error("LICENSE_PICK_FAILED", error.message ?: error.toString(), null)
         }
-    }
-
-    private fun extractTokenFromIntent(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_VIEW) return
-        val uri = intent.data ?: return
-        try {
-            val content = contentResolver.openInputStream(uri)?.use {
-                it.readBytes().toString(Charsets.UTF_8)
-            } ?: return
-            // Validare rapidă: trebuie să conțină identificatorul aplicației
-            if (content.contains("\"organizator\"")) {
-                pendingLicenseToken = content
-            }
-        } catch (_: Exception) {}
     }
 
     // ── Flutter Engine ───────────────────────────────────────────────────────────
@@ -255,23 +223,6 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
 
-                    "isLicensed" -> {
-                        val prefs = getSharedPreferences("LicensePrefs", Context.MODE_PRIVATE)
-                        result.success(prefs.getBoolean("licensed", false))
-                    }
-
-                    "getPendingToken" -> {
-                        result.success(pendingLicenseToken)
-                        pendingLicenseToken = null
-                    }
-
-                    "verifyAndActivate" -> {
-                        val token = call.argument<String>("token")
-                            ?: run { result.error("ARG", "missing token", null); return@setMethodCallHandler }
-                        val res = verifyAndActivate(token)
-                        result.success(mapOf("success" to res.first, "msg" to res.second))
-                    }
-
                     // ── Flux nou: licență cu businessId + expirare, cumpărată de pe site ──
                     "getBusinessId" -> result.success(LicenseStore.getOrCreateBusinessId(this))
                     "checkLicense" -> result.success(LicenseStore.check(this).toMap(null))
@@ -290,61 +241,6 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
-    }
-
-    // ── Verificare și activare licență ───────────────────────────────────────────
-    private fun verifyAndActivate(tokenJson: String): Pair<Boolean, String> {
-        return try {
-            val prefs      = getSharedPreferences("LicensePrefs", Context.MODE_PRIVATE)
-            val usedIdsJson = prefs.getString("used_ids", "[]") ?: "[]"
-            val usedArr    = JSONArray(usedIdsJson)
-            val usedSet    = (0 until usedArr.length()).map { usedArr.getString(it) }.toSet()
-
-            // Acceptăm și un singur obiect JSON (nu doar array)
-            val tokens = if (tokenJson.trim().startsWith("[")) {
-                JSONArray(tokenJson)
-            } else {
-                JSONArray().apply { put(JSONObject(tokenJson)) }
-            }
-
-            // Încarcă cheia publică (SPKI/X.509 DER, base64 concatenat)
-            val keyBytes  = Base64.decode(LicenseStore.PUBLIC_KEY_B64, Base64.DEFAULT)
-            val publicKey = KeyFactory.getInstance("RSA")
-                .generatePublic(X509EncodedKeySpec(keyBytes))
-
-            for (i in 0 until tokens.length()) {
-                val t      = tokens.getJSONObject(i)
-                val id     = t.optString("id", "")
-                val app    = t.optString("app", "")
-                val issued = t.optString("issued", "")
-                val sigB64 = t.optString("sig", "")
-
-                if (id.isEmpty() || sigB64.isEmpty()) continue
-                if (app != "organizator") continue
-                if (id in usedSet) continue          // deja folosit pe acest dispozitiv
-
-                val data = "organizator:${id}:${issued}".toByteArray(Charsets.UTF_8)
-                val sig  = Base64.decode(sigB64, Base64.DEFAULT)
-
-                val verifier = Signature.getInstance("SHA256withRSA")
-                verifier.initVerify(publicKey)
-                verifier.update(data)
-
-                if (verifier.verify(sig)) {
-                    // Valid — stocăm activarea
-                    usedArr.put(id)
-                    prefs.edit()
-                        .putBoolean("licensed", true)
-                        .putString("used_ids", usedArr.toString())
-                        .apply()
-                    return Pair(true, "Licență activată cu succes!")
-                }
-            }
-
-            Pair(false, "Token invalid sau deja utilizat pe acest dispozitiv.")
-        } catch (e: Exception) {
-            Pair(false, "Eroare la verificare: ${e.message}")
-        }
     }
 
     private fun shareLicenseWithBoard(boardId: String): String {

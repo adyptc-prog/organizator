@@ -39,7 +39,7 @@ void main() {
       calls.add(call.method);
       switch (call.method) {
         case 'isLicensed':
-          return false;
+          return true; // flag-ul vechi .orgtoken — nu trebuie să mai conteze
         case 'checkLicense':
           return checkResponse;
         case 'getBusinessId':
@@ -139,6 +139,13 @@ void main() {
       final r = await LicenseService.pickLicenseFile();
       expect(r.success, isTrue);
       expect(LicenseService.isLicensed, isTrue);
+    });
+
+    test('vechiul cod .orgtoken nu mai activează aplicația', () async {
+      // Nativ, un telefon vechi poate avea încă flag-ul „licensed” — ignorat.
+      await LicenseService.load();
+      expect(LicenseService.isLicensed, isFalse);
+      expect(calls, isNot(contains('isLicensed')));
     });
 
     test('non-Android: nelimitat, fără apeluri native', () async {
