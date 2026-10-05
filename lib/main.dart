@@ -107,7 +107,7 @@ class NotificationService {
   // suprapună între tabele diferite — pentru tabelul 0 (primul, migrat din
   // versiunea cu un singur tabel) formula rămâne identică cu cea veche.
   static Future<void> scheduleFor(Item item, {required int boardIndex}) async {
-    if (!Platform.isAndroid) return;
+    if (!_isAndroid) return;
     await cancelFor(item.number, boardIndex: boardIndex);
     final now  = DateTime.now();
     final base = boardIndex * 1000000;
@@ -133,7 +133,7 @@ class NotificationService {
   }
 
   static Future<void> cancelFor(int number, {required int boardIndex}) async {
-    if (!Platform.isAndroid) return;
+    if (!_isAndroid) return;
     final base = boardIndex * 1000000;
     try {
       await _ch.invokeMethod<void>('cancelNotif', {'id': base + number * 10 + 1});
@@ -245,7 +245,10 @@ class SmsService {
 
   static Future<void> scheduleFor(Item item,
       {String template = _kDefaultSmsTemplate, required int boardIndex}) async {
-    cancelFor(item.number, boardIndex: boardIndex);
+    if (!isAndroid) return;
+    // Așteptăm anularea: altfel ștergerea payload-ului vechi (sms_alarm_<id>)
+    // și anularea nativă pot ajunge DUPĂ programarea nouă, sub același id.
+    await cancelFor(item.number, boardIndex: boardIndex);
     final phones = item.phones;
     if (phones.isEmpty) return;
 
@@ -273,17 +276,19 @@ class SmsService {
     }
   }
 
-  static void cancelFor(int number, {required int boardIndex}) {
+  static Future<void> cancelFor(int number, {required int boardIndex}) async {
+    if (!isAndroid) return;
     final base = boardIndex * 10000000;
     final ids = [
       ..._warnIds(number, boardIndex), ..._expIds(number, boardIndex),
       base + number * 10 + 3, base + number * 10 + 4,
     ];
+    final prefs = await SharedPreferences.getInstance();
     for (final id in ids) {
-      _ch.invokeMethod<void>('cancel', {'id': id}).ignore();
-      SharedPreferences.getInstance()
-          .then((p) => p.remove('sms_alarm_$id'))
-          .ignore();
+      try {
+        await _ch.invokeMethod<void>('cancel', {'id': id});
+      } catch (_) {}
+      await prefs.remove('sms_alarm_$id');
     }
   }
 
@@ -373,9 +378,9 @@ class ValidationService {
   // fără efecte secundare, pentru că termenul se calculează mereu din
   // createdAt, nu din momentul apelului.
   static Future<void> scheduleFor(Item item, String boardId) async {
-    if (!Platform.isAndroid) return;
+    if (!_isAndroid) return;
     if (item.validated) {
-      cancelFor(item.syncId);
+      await cancelFor(item.syncId);
       return;
     }
     final deadline = item.createdAt.add(const Duration(hours: 24));
@@ -391,13 +396,14 @@ class ValidationService {
     } catch (_) {}
   }
 
-  static void cancelFor(String syncId) {
-    if (!Platform.isAndroid) return;
+  static Future<void> cancelFor(String syncId) async {
+    if (!_isAndroid) return;
     final id = _alarmId(syncId);
-    _ch.invokeMethod<void>('cancelValidation', {'id': id}).ignore();
-    SharedPreferences.getInstance()
-        .then((p) => p.remove('validation_alarm_$id'))
-        .ignore();
+    try {
+      await _ch.invokeMethod<void>('cancelValidation', {'id': id});
+    } catch (_) {}
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('validation_alarm_$id');
   }
 }
 
@@ -1407,6 +1413,7 @@ class _ManagementPageState extends State<ManagementPage>
     }
 
     bool changed = false;
+    final removed = <Item>[];
     for (final msg in messages) {
       try {
         if (msg.startsWith('ORG:A:') || msg.startsWith('ORG:I:')) {
@@ -1437,7 +1444,7 @@ class _ManagementPageState extends State<ManagementPage>
           if (idx != -1) {
             deletedBuffer.add(
                 DeletedItem(item: items[idx], deletedAt: DateTime.now()));
-            items.removeAt(idx);
+            removed.add(items.removeAt(idx));
             changed = true;
           }
         }
@@ -1449,6 +1456,16 @@ class _ManagementPageState extends State<ManagementPage>
 
     if (!changed) return;
 
+    // Înregistrările șterse își pierd toate alarmele. Renumerotarea de mai jos
+    // le acoperă doar când numărul lor e preluat de altă înregistrare — cea
+    // cu numărul cel mai mare (de ex. anularea prin SMS a ultimei rezervări)
+    // rămânea cu reminderele SMS/notificările active.
+    for (final item in removed) {
+      await NotificationService.cancelFor(item.number, boardIndex: boardIndex);
+      await SmsService.cancelFor(item.number, boardIndex: boardIndex);
+      await ValidationService.cancelFor(item.syncId);
+    }
+
     // Anulăm alarmele vechi (SMS + notificări) pentru orice item care își
     // schimbă numărul la renumerotare — altfel rămân alarme "orfane"
     // programate sub numărul vechi, iar noul număr nu are nicio alarmă.
@@ -1456,7 +1473,7 @@ class _ManagementPageState extends State<ManagementPage>
       if (items[i].number != i + 1) {
         await NotificationService.cancelFor(items[i].number,
             boardIndex: boardIndex);
-        SmsService.cancelFor(items[i].number, boardIndex: boardIndex);
+        await SmsService.cancelFor(items[i].number, boardIndex: boardIndex);
       }
     }
     // Renumerotare secvențială după orice modificare prin sync
@@ -2604,7 +2621,7 @@ class _ManagementPageState extends State<ManagementPage>
       final syncId = item.syncId; // salvăm înainte de ștergere
       await NotificationService.cancelFor(item.number,
           boardIndex: _activeBoardIndex);
-      SmsService.cancelFor(item.number, boardIndex: _activeBoardIndex);
+      await SmsService.cancelFor(item.number, boardIndex: _activeBoardIndex);
       _deletedBuffer.add(DeletedItem(item: item, deletedAt: DateTime.now()));
 
       // Reținem înregistrările care își schimbă numărul la renumerotare,
@@ -2626,7 +2643,7 @@ class _ManagementPageState extends State<ManagementPage>
       for (final oldItem in renumbered) {
         await NotificationService.cancelFor(oldItem.number,
             boardIndex: _activeBoardIndex);
-        SmsService.cancelFor(oldItem.number, boardIndex: _activeBoardIndex);
+        await SmsService.cancelFor(oldItem.number, boardIndex: _activeBoardIndex);
       }
       for (final oldItem in renumbered) {
         final newItem =
@@ -2641,7 +2658,7 @@ class _ManagementPageState extends State<ManagementPage>
       // Nu mai are rost termenul de validare — rezervarea a fost ștearsă
       // acum, nu are sens ca ValidationDeadlineReceiver să mai încerce peste
       // câteva ore să o șteargă din nou și să trimită un al doilea SMS.
-      ValidationService.cancelFor(syncId);
+      await ValidationService.cancelFor(syncId);
       if (_bookingSettings.mode == BoardMode.zile &&
           item.phoneNumber != null &&
           item.phoneNumber!.isNotEmpty) {
