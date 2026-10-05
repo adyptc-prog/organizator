@@ -71,7 +71,7 @@ object LicenseStore {
 
     // Anti-clock-manipulation: monotonically non-decreasing "effective now",
     // identical logic to Fidelio's getEffectiveNow().
-    private fun effectiveNow(context: Context): Long {
+    internal fun effectiveNow(context: Context): Long {
         val prefs = prefs(context)
         val lastMs = prefs.getLong(KEY_LAST_CHECK, 0L)
         val deviceNow = System.currentTimeMillis()

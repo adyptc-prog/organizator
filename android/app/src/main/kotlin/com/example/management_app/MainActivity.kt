@@ -225,7 +225,15 @@ class MainActivity : FlutterActivity() {
 
                     // ── Flux nou: licență cu businessId + expirare, cumpărată de pe site ──
                     "getBusinessId" -> result.success(LicenseStore.getOrCreateBusinessId(this))
-                    "checkLicense" -> result.success(LicenseStore.check(this).toMap(null))
+                    "checkLicense" -> {
+                        val map = LicenseStore.check(this).toMap(null)
+                        // Trial-ul, calculat cu același ceas protejat ca licența.
+                        val start = Entitlement.trialStartMs(this)
+                        val now = LicenseStore.effectiveNow(this)
+                        map["trialActive"] = Entitlement.isTrialActive(start, now)
+                        map["trialDaysLeft"] = Entitlement.trialDaysLeft(start, now)
+                        result.success(map)
+                    }
                     "pickLicenseFile" -> pickLicenseFile(result)
                     // Trimite licența partenerului unui tabel, dacă are voie:
                     // "sent" | "no_license" | "not_owner" | "other_partner" |

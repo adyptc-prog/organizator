@@ -1690,6 +1690,13 @@ class _ManagementPageState extends State<ManagementPage>
                 'Perioada de trial gratuită de 1 lună a expirat.',
                 style: TextStyle(fontWeight: FontWeight.w600),
               ),
+              const SizedBox(height: 6),
+              const Text(
+                'Botul de rezervări prin SMS și reminderele SMS sunt oprite '
+                'până la activarea licenței. Datele, sincronizarea și '
+                'backup-ul funcționează în continuare.',
+                style: TextStyle(fontSize: 12),
+              ),
               const SizedBox(height: 12),
               const Text(
                 'Cumpără o licență pe voltacademy.app/organizator.html folosind codul de instalare de mai jos, apoi importă fișierul descărcat:',

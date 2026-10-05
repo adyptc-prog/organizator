@@ -132,6 +132,12 @@ class ClientBookingReceiver : BroadcastReceiver() {
             Diag.w("handleMessage: senderDigits empty, aborting")
             return
         }
+        // După expirarea trial-ului, fără licență, botul nu mai răspunde
+        // (fiecare răspuns e un SMS trimis de aplicație).
+        if (!Entitlement.isActive(context)) {
+            Diag.i("handleMessage: no license and trial expired, bot disabled")
+            return
+        }
         if (!BotLimits.isReplyableSender(sender)) {
             Diag.i("handleMessage: sender is not a phone number, ignoring")
             return

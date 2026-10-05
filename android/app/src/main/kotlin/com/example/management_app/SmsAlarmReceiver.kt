@@ -29,6 +29,13 @@ class SmsAlarmReceiver : BroadcastReceiver() {
 
                 if (phone.isBlank() || message.isBlank()) return@Thread
 
+                // Reminderele SMS cer licență sau trial activ — verificat la
+                // trimitere, deci și pentru alarmele programate înainte.
+                if (!Entitlement.isActive(context)) {
+                    Diag.i("SmsAlarmReceiver: no license and trial expired, SMS not sent")
+                    return@Thread
+                }
+
                 // Împărțit în segmente: un text cu diacritice peste 70 de
                 // caractere nu pleacă altfel (sendTextMessage eșua silențios).
                 SmsSender.send(context, phone, message)

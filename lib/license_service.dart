@@ -49,12 +49,20 @@ class LicenseService {
       ? null
       : DateTime.tryParse(newLicenseValidUntil!)?.toLocal();
 
+  // Pe Android trial-ul e calculat nativ, cu ceasul protejat al licenței
+  // (dat înapoi nu-l prelungește) — aceeași valoare pe care o folosesc botul
+  // și reminderele SMS. Calculul local rămâne doar ca rezervă.
+  static bool? _nativeTrialActive;
+  static int? _nativeTrialDaysLeft;
+
   static bool get isTrialActive {
+    if (_nativeTrialActive != null) return _nativeTrialActive!;
     if (_trialStart == null) return false;
     return DateTime.now().isBefore(_trialStart!.add(const Duration(days: _trialDays)));
   }
 
   static int get trialDaysLeft {
+    if (_nativeTrialDaysLeft != null) return _nativeTrialDaysLeft!;
     if (_trialStart == null) return 0;
     final expiry = _trialStart!.add(const Duration(days: _trialDays));
     final left   = expiry.difference(DateTime.now()).inDays;
@@ -65,8 +73,8 @@ class LicenseService {
 
   static Future<void> load() async {
     if (!_isAndroid) return;
-    await checkNewLicense();
-    // Înregistrăm data primei instalări (trial start)
+    // Data primei instalări (start trial) — salvată înainte de verificarea
+    // nativă, care o citește.
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getString(_kTrialStartKey);
     if (saved == null) {
@@ -75,6 +83,7 @@ class LicenseService {
     } else {
       _trialStart = DateTime.tryParse(saved);
     }
+    await checkNewLicense();
   }
 
   static void _apply(Map<Object?, Object?>? r) {
@@ -83,6 +92,8 @@ class LicenseService {
     newLicenseValidUntil = r?['validUntil'] as String?;
     newLicenseDaysUntilExpiry = r?['daysUntilExpiry'] as int?;
     newLicenseIsLifetime = (r?['isLifetime'] as bool?) ?? false;
+    _nativeTrialActive = r?['trialActive'] as bool?;
+    _nativeTrialDaysLeft = r?['trialDaysLeft'] as int?;
   }
 
   static Future<void> checkNewLicense() async {

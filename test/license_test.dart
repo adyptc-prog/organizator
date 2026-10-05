@@ -80,6 +80,21 @@ void main() {
       expect(LicenseService.canAdd, isFalse);
     });
 
+    test('pe Android contează trial-ul calculat nativ (ceas protejat)',
+        () async {
+      // Local pare abia început, dar nativ (ceasul fusese dat înapoi) a expirat.
+      checkResponse = {
+        'status': 'missing',
+        'message': '',
+        'trialActive': false,
+        'trialDaysLeft': 0,
+      };
+      await LicenseService.load();
+      expect(LicenseService.isTrialActive, isFalse);
+      expect(LicenseService.trialDaysLeft, 0);
+      expect(LicenseService.canAdd, isFalse);
+    });
+
     test('licență activă de la site', () async {
       checkResponse = _activeLicense();
       await LicenseService.load();

@@ -135,7 +135,8 @@ class _LicenseScreenState extends State<LicenseScreen> {
       icon: Icons.lock_outline,
       color: Colors.red.shade700,
       title: 'Fără licență',
-      subtitle: 'Perioada de trial a expirat.$invalidNote',
+      subtitle: 'Perioada de trial a expirat. Botul de rezervări și '
+          'reminderele SMS sunt oprite până la activarea licenței.$invalidNote',
     );
   }
 
