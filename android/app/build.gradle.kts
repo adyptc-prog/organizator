@@ -8,7 +8,10 @@ plugins {
 }
 
 val keyProperties = Properties().apply {
-    val keyPropertiesFile = rootProject.file("key.properties")
+    // -PkeyProperties=<cale> permite alt fișier (ex. CI); implicit android/key.properties.
+    val keyPropertiesFile = rootProject.file(
+        providers.gradleProperty("keyProperties").getOrElse("key.properties")
+    )
     if (keyPropertiesFile.exists()) load(keyPropertiesFile.inputStream())
 }
 
@@ -58,9 +61,27 @@ android {
 
     buildTypes {
         release {
-            val releaseConfig = signingConfigs.getByName("release")
-            signingConfig = if (releaseConfig.storeFile != null) releaseConfig
-                            else signingConfigs.getByName("debug")
+            // Întotdeauna cheia de release: fără key.properties build-ul de
+            // release eșuează (vezi mai jos), în loc să producă pe tăcute un
+            // APK semnat cu cheia de debug, care nu se poate instala peste
+            // versiunea publicată.
+            signingConfig = signingConfigs.getByName("release")
+        }
+    }
+}
+
+val releaseKeyMissing = keyProperties["storeFile"]
+    ?.let { !project.file(it as String).exists() } ?: true
+
+// preReleaseBuild rulează la începutul oricărui build de release (APK sau bundle).
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    doFirst {
+        if (releaseKeyMissing) {
+            // Fără diacritice: consola Windows le afișează greșit.
+            throw GradleException(
+                "Lipseste cheia de semnare release: creeaza android/key.properties " +
+                    "(storeFile, storePassword, keyAlias, keyPassword) cu keystore-ul aplicatiei."
+            )
         }
     }
 }
