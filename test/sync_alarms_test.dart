@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -167,6 +168,29 @@ void main() {
     final prefs = await SharedPreferences.getInstance();
     final items = jsonDecode(prefs.getString('management_items_b1')!) as List;
     expect(items.firstWhere((i) => i['syncId'] == 'botb')['viaBot'], isTrue);
+  });
+
+  testWidgets('template-ul SMS nou se aplică pe toate tabelele', (tester) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('management_items_b2',
+        jsonEncode([_item(1, 'tab2', '0744444444')]));
+
+    await tester.pumpWidget(const ManagementApp());
+    await settle(tester);
+
+    await tester.tap(find.text('Mesaj SMS'));
+    await settle(tester);
+    await tester.enterText(find.widgetWithText(TextField, 'Template mesaj'),
+        'Nou: [NUME]');
+    await tester.tap(find.text('Salvează'));
+    await settle(tester);
+
+    // Tabelul 2 (index 1): avertizare = 10000000 + 1*100 + 10.
+    final payload = jsonDecode(prefs.getString('sms_alarm_10000110')!);
+    expect(payload['message'], 'Nou: Client 1');
+    expect(payload['phone'], '0744444444');
+    // Și tabelul activ.
+    expect(jsonDecode(prefs.getString('sms_alarm_110')!)['message'], 'Nou: Client 1');
   });
 }
 

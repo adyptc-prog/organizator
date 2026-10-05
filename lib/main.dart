@@ -4162,6 +4162,34 @@ class _ManagementPageState extends State<ManagementPage>
     );
   }
 
+  // Template-ul e comun tuturor tabelelor — reminderele deja programate pe
+  // fiecare tabel (nu doar pe cel activ) se refac cu textul nou.
+  Future<void> _rescheduleSmsAllBoards(String template) async {
+    final prefs = await SharedPreferences.getInstance();
+    for (var boardIndex = 0; boardIndex < _boards.length; boardIndex++) {
+      final boardId = _boards[boardIndex].id;
+      final List<Item> items;
+      if (boardId == _activeBoardId) {
+        items = _items;
+      } else {
+        final jsonStr = prefs.getString(_itemsKeyFor(boardId));
+        if (jsonStr == null) continue;
+        try {
+          items = (jsonDecode(jsonStr) as List<dynamic>)
+              .map((e) => Item.fromJson(e as Map<String, dynamic>))
+              .toList();
+        } catch (_) {
+          continue;
+        }
+      }
+      for (final item in items) {
+        if (item.phones.isEmpty) continue;
+        await SmsService.scheduleFor(item,
+            template: template, boardIndex: boardIndex);
+      }
+    }
+  }
+
   // ── Dialog editare template SMS ───────────────────────────────────────────────
   Future<void> _showSmsTemplateDialog() async {
     final ctrl = TextEditingController(text: _smsTemplate);
@@ -4221,13 +4249,7 @@ class _ManagementPageState extends State<ManagementPage>
               await prefs.setString(_kSmsTemplateKey, tmpl);
               if (!ctx.mounted) return;
               Navigator.pop(ctx);
-              for (final item in _items) {
-                if (item.phoneNumber != null &&
-                    item.phoneNumber!.isNotEmpty) {
-                  await SmsService.scheduleFor(item,
-                      template: tmpl, boardIndex: _activeBoardIndex);
-                }
-              }
+              await _rescheduleSmsAllBoards(tmpl);
             },
             child: const Text('Salvează'),
           ),
@@ -4272,8 +4294,12 @@ class _ManagementPageState extends State<ManagementPage>
                     color: Color(0xFF3730A3))),
           ),
           const SizedBox(width: 8),
-          Text(desc,
-              style: const TextStyle(fontSize: 12, color: Colors.grey)),
+          // Flexible: pe ecrane înguste descrierea se rupe pe rând nou în loc
+          // să depășească dialogul.
+          Flexible(
+            child: Text(desc,
+                style: const TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
         ],
       ),
     );
