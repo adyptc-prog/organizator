@@ -119,7 +119,7 @@ object BookingSettings {
                 var skippedNoExpiry = 0
                 var skippedBadDate = 0
                 for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
+                    val o = arr.optJSONObject(i) ?: continue
                     if (o.isNull("expiresAt")) { skippedNoExpiry++; continue }
                     val expiresStr = o.optString("expiresAt", "")
                     if (expiresStr.isEmpty()) { skippedNoExpiry++; continue }
@@ -137,23 +137,11 @@ object BookingSettings {
         // (stau în coada de sincronizare) — trebuie tratate ca ocupate, altfel doi
         // clienți ar putea primi aceeași oră liberă înainte ca aplicația să fie
         // deschisă și coada procesată.
-        val queueJson = context
-            .getSharedPreferences(SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(SmsSyncReceiver.QUEUE_KEY, "[]") ?: "[]"
-        try {
-            val arr = JSONArray(queueJson)
-            for (i in 0 until arr.length()) {
-                val entry = arr.getJSONObject(i)
-                if (entry.optString("board", "") != boardId) continue
-                val msg = entry.optString("msg", "")
-                if (!msg.startsWith("ORG:A:") && !msg.startsWith("ORG:I:") && !msg.startsWith("ORG:U:")) continue
-                val j = JSONObject(msg.substring(6))
-                val expiresStr = j.optString("e", "")
-                if (expiresStr.isEmpty()) continue
-                val end = parseFlexibleIso(expiresStr) ?: continue
-                result.add(BusyInterval(end.minusMinutes(durationMin.toLong()), end))
-            }
-        } catch (_: Exception) {
+        for ((prefix, payload) in queuedEntries(context, boardId)) {
+            if (prefix !in ITEM_PREFIXES) continue
+            val j = parsePayload(payload) ?: continue
+            val end = parseFlexibleIso(j.optString("e", "")) ?: continue
+            result.add(BusyInterval(end.minusMinutes(durationMin.toLong()), end))
         }
 
         return result
@@ -180,7 +168,7 @@ object BookingSettings {
             try {
                 val arr = JSONArray(itemsJson)
                 for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
+                    val o = arr.optJSONObject(i) ?: continue
                     val syncId = o.optString("syncId", "")
                     if (syncId.isEmpty()) continue
                     val phones = listOfNotNull(
@@ -209,51 +197,34 @@ object BookingSettings {
             }
         }
 
-        val queueJson = context
-            .getSharedPreferences(SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(SmsSyncReceiver.QUEUE_KEY, "[]") ?: "[]"
-        try {
-            val arr = JSONArray(queueJson)
-            for (i in 0 until arr.length()) {
-                val entry = arr.getJSONObject(i)
-                if (entry.optString("board", "") != boardId) continue
-                val msg = entry.optString("msg", "")
-                if (msg.startsWith("ORG:D:")) {
-                    // Ștergere încă neprocesată — nu o oferim la anulare.
-                    result.remove(msg.substring(6).trim())
-                    continue
-                }
-                val prefix = when {
-                    msg.startsWith("ORG:A:") -> "ORG:A:"
-                    msg.startsWith("ORG:I:") -> "ORG:I:"
-                    msg.startsWith("ORG:U:") -> "ORG:U:"
-                    else -> continue
-                }
-                val j = JSONObject(msg.substring(prefix.length))
-                val syncId = j.optString("s", "")
-                if (syncId.isEmpty()) continue
-                val phones = listOfNotNull(
-                    j.optString("p1", "").takeIf { it.isNotEmpty() },
-                    j.optString("p2", "").takeIf { it.isNotEmpty() },
-                    j.optString("p3", "").takeIf { it.isNotEmpty() },
-                )
-                if (phones.isEmpty()) continue
-                val expiresStr = j.optString("e", "")
-                val expiresAt = if (expiresStr.isEmpty()) null else parseFlexibleIso(expiresStr)
-                val startsStr = j.optString("st", "")
-                val startsAt = if (startsStr.isEmpty()) null else parseFlexibleIso(startsStr)
-                result[syncId] = BookedItem(
-                    boardId = boardId,
-                    syncId = syncId,
-                    name = j.optString("n", ""),
-                    description = j.optString("d", ""),
-                    phones = phones,
-                    expiresAt = expiresAt,
-                    startsAt = startsAt,
-                    validated = j.optBoolean("v", false),
-                )
+        for ((prefix, payload) in queuedEntries(context, boardId)) {
+            if (prefix == "ORG:D:") {
+                // Ștergere încă neprocesată — nu o oferim la anulare.
+                result.remove(payload.trim())
+                continue
             }
-        } catch (_: Exception) {
+            if (prefix !in ITEM_PREFIXES) continue
+            val j = parsePayload(payload) ?: continue
+            val syncId = j.optString("s", "")
+            if (syncId.isEmpty()) continue
+            val phones = listOfNotNull(
+                j.optString("p1", "").takeIf { it.isNotEmpty() },
+                j.optString("p2", "").takeIf { it.isNotEmpty() },
+                j.optString("p3", "").takeIf { it.isNotEmpty() },
+            )
+            if (phones.isEmpty()) continue
+            val expiresStr = j.optString("e", "")
+            val startsStr = j.optString("st", "")
+            result[syncId] = BookedItem(
+                boardId = boardId,
+                syncId = syncId,
+                name = j.optString("n", ""),
+                description = j.optString("d", ""),
+                phones = phones,
+                expiresAt = if (expiresStr.isEmpty()) null else parseFlexibleIso(expiresStr),
+                startsAt = if (startsStr.isEmpty()) null else parseFlexibleIso(startsStr),
+                validated = j.optBoolean("v", false),
+            )
         }
 
         return result.values.toList()
@@ -273,7 +244,7 @@ object BookingSettings {
             try {
                 val arr = JSONArray(itemsJson)
                 for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
+                    val o = arr.optJSONObject(i) ?: continue
                     val expiresStr = o.optString("expiresAt", "")
                     if (o.isNull("expiresAt") || expiresStr.isEmpty()) continue
                     val end = parseFlexibleIso(expiresStr) ?: continue
@@ -292,27 +263,45 @@ object BookingSettings {
 
         // La fel ca la loadBusyIntervals: și rezervările din coada de sincronizare
         // neprocesate încă trebuie tratate ca ocupate.
-        val queueJson = context
-            .getSharedPreferences(SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(SmsSyncReceiver.QUEUE_KEY, "[]") ?: "[]"
-        try {
-            val arr = JSONArray(queueJson)
-            for (i in 0 until arr.length()) {
-                val entry = arr.getJSONObject(i)
-                if (entry.optString("board", "") != boardId) continue
-                val msg = entry.optString("msg", "")
-                if (!msg.startsWith("ORG:A:") && !msg.startsWith("ORG:I:") && !msg.startsWith("ORG:U:")) continue
-                val j = JSONObject(msg.substring(6))
-                val expiresStr = j.optString("e", "")
-                if (expiresStr.isEmpty()) continue
-                val end = parseFlexibleIso(expiresStr) ?: continue
-                val startsStr = j.optString("st", "")
-                val start = if (startsStr.isEmpty()) end.minusDays(1) else (parseFlexibleIso(startsStr) ?: end.minusDays(1))
-                result.add(BusyInterval(start, end))
-            }
-        } catch (_: Exception) {
+        for ((prefix, payload) in queuedEntries(context, boardId)) {
+            if (prefix !in ITEM_PREFIXES) continue
+            val j = parsePayload(payload) ?: continue
+            val end = parseFlexibleIso(j.optString("e", "")) ?: continue
+            val startsStr = j.optString("st", "")
+            val start = if (startsStr.isEmpty()) end.minusDays(1) else (parseFlexibleIso(startsStr) ?: end.minusDays(1))
+            result.add(BusyInterval(start, end))
         }
 
         return result
     }
+
+    // Intrările din coada de sincronizare pentru un tabel, încă neprocesate de
+    // Flutter, ca (prefix, payload). Fiecare intrare e citită separat — una
+    // coruptă e sărită, fără să le ascundă pe cele de după ea (altfel o oră
+    // deja rezervată ar fi oferită din nou).
+    private fun queuedEntries(context: Context, boardId: String): List<Pair<String, String>> {
+        val queueJson = context
+            .getSharedPreferences(SmsSyncReceiver.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(SmsSyncReceiver.QUEUE_KEY, "[]") ?: "[]"
+        val arr = try { JSONArray(queueJson) } catch (_: Exception) { return emptyList() }
+        val result = mutableListOf<Pair<String, String>>()
+        for (i in 0 until arr.length()) {
+            val entry = arr.optJSONObject(i) ?: continue
+            if (entry.optString("board", "") != boardId) continue
+            val msg = entry.optString("msg", "")
+            if (msg.length < 6 || !msg.startsWith("ORG:")) continue
+            result.add(msg.substring(0, 6) to msg.substring(6))
+        }
+        return result
+    }
+
+    // Payload-ul JSON al unei intrări „ORG:A/I/U:”, sau null dacă e corupt.
+    private fun parsePayload(payload: String): JSONObject? = try {
+        JSONObject(payload)
+    } catch (_: Exception) {
+        Log.w("OrgDiag", "queued sync entry skipped: invalid JSON")
+        null
+    }
+
+    private val ITEM_PREFIXES = setOf("ORG:A:", "ORG:I:", "ORG:U:")
 }
