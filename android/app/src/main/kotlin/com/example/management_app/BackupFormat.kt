@@ -43,8 +43,10 @@ object BackupFormat {
     // Partenerii de sincronizare (câte unul per tabel, plus cheia veche de
     // dinainte de tabele multiple). La restore pe telefonul partener, cei din
     // backup ar fi propriul număr — implicit se păstrează cei actuali.
+    // Codul de împerechere (flutter.sync_secret_<tabel>) aparține partenerului
+    // și se păstrează/restaurează împreună cu numărul lui.
     fun isSyncPartnerKey(key: String): Boolean =
-        key.startsWith("flutter.sync_partner_phone")
+        key.startsWith("flutter.sync_partner_phone") || key.startsWith("flutter.sync_secret")
 
     fun isBackedUpKey(key: String): Boolean =
         key.startsWith(FLUTTER_PREFIX) && key !in EXCLUDED_KEYS

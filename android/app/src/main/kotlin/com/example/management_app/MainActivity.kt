@@ -188,6 +188,17 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
 
+                    // Mesaj de sincronizare către partenerul unui tabel, semnat
+                    // cu codul de împerechere (SyncAuth). false = fără partener
+                    // sau fără cod — nu s-a trimis nimic.
+                    "sendSync" -> {
+                        val boardId = call.argument<String>("boardId")
+                            ?: run { result.error("ARG", "missing boardId", null); return@setMethodCallHandler }
+                        val message = call.argument<String>("message")
+                            ?: run { result.error("ARG", "missing message", null); return@setMethodCallHandler }
+                        result.success(SmsSyncReceiver.sendSigned(this, boardId, message))
+                    }
+
                     "computeFreeSlots" -> {
                         val boardId = call.argument<String>("boardId")
                             ?: run { result.error("ARG", "missing boardId", null); return@setMethodCallHandler }

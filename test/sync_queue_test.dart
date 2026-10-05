@@ -39,12 +39,12 @@ class _FakeNativeQueue {
         afterRead?.call();
         afterRead = null;
         return snapshot;
-      case 'sendSms':
+      case 'sendSync':
         sent.add({
-          'phone': call.arguments['phone'] as String,
+          'board': call.arguments['boardId'] as String,
           'message': call.arguments['message'] as String,
         });
-        return null;
+        return true;
       case 'ackSyncMessages':
         final ids = (call.arguments['ids'] as List).cast<String>();
         acked.add(ids);
@@ -150,8 +150,8 @@ void main() {
     await settle(tester);
 
     expect(queue.sent, [
-      {'phone': '0755555555', 'message': _add('aaaa', 'Rezervare bot')},
-      {'phone': '0755555555', 'message': 'ORG:D:zzzz'},
+      {'board': 'b2', 'message': _add('aaaa', 'Rezervare bot')},
+      {'board': 'b2', 'message': 'ORG:D:zzzz'},
     ]);
   });
 

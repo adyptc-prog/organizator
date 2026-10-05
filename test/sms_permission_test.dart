@@ -165,12 +165,15 @@ void main() {
   });
 
   group('sincronizare cu SMS blocat', () {
-    Future<void> tapSync(WidgetTester tester) async {
+    Future<void> tapSync(WidgetTester tester, {String code = 'k7qm-2xpa'}) async {
       await tester.pumpWidget(const ManagementApp());
       await settle(tester);
       await tester.tap(find.byTooltip('Configurează sincronizare'));
       await settle(tester);
-      await tester.enterText(find.byType(TextField).last, '0722000111');
+      await tester.enterText(
+          find.widgetWithText(TextField, 'Număr telefon partener *'), '0722000111');
+      await tester.enterText(
+          find.widgetWithText(TextField, 'Cod de împerechere *'), code);
       await tester.tap(find.text('Sincronizează'));
       await settle(tester);
     }
@@ -190,8 +193,33 @@ void main() {
       expect(find.textContaining('Permite setările restricționate'), findsNothing);
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString('sync_partner_phone_b1'), '0722000111');
+      // Codul e salvat normalizat — identic pe ambele telefoane.
+      expect(prefs.getString('sync_secret_b1'), 'K7QM2XPA');
       // Sincronizarea inițială trimite SMS-urile la 1,5 s distanță.
       await tester.pump(const Duration(seconds: 15));
+    });
+
+    testWidgets('fără cod de împerechere valid partenerul nu e salvat',
+        (tester) async {
+      statuses[Permission.sms.value] = _granted;
+      await tapSync(tester, code: 'abc');
+      expect(find.text('Minim 8 litere/cifre.'), findsOneWidget);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('sync_partner_phone_b1'), isNull);
+      expect(prefs.getString('sync_secret_b1'), isNull);
+    });
+
+    testWidgets('„Generează cod” completează un cod valid', (tester) async {
+      await tester.pumpWidget(const ManagementApp());
+      await settle(tester);
+      await tester.tap(find.byTooltip('Configurează sincronizare'));
+      await settle(tester);
+      await tester.tap(find.byTooltip('Generează cod'));
+      await settle(tester);
+      final field = tester.widget<TextField>(
+          find.widgetWithText(TextField, 'Cod de împerechere *'));
+      expect(SyncService.isValidCode(field.controller!.text), isTrue);
+      expect(field.controller!.text, matches(RegExp(r'^[A-Z2-9]{4}-[A-Z2-9]{4}$')));
     });
   });
 

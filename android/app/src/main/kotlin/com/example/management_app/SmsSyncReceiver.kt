@@ -14,7 +14,8 @@ import org.json.JSONObject
  * (mesaje de sincronizare trimise de celălalt dispozitiv Organizator).
  * Fiecare tabel poate avea propriul partener de sincronizare, deci fiecare
  * mesaj e etichetat cu tabelul al cărui partener configurat corespunde
- * expeditorului.
+ * expeditorului. Mesajele trebuie să fie semnate cu codul de împerechere al
+ * tabelului (vezi SyncAuth) — cele nesemnate sunt ignorate.
  *
  * Flutter citește coada la pornire și la revenire în foreground via
  * MethodChannel "organizator/sms" → getSyncMessages / ackSyncMessages.
@@ -108,6 +109,22 @@ class SmsSyncReceiver : BroadcastReceiver() {
             }
         }
 
+        fun secretKey(boardId: String) = "flutter.sync_secret_$boardId"
+
+        /**
+         * Trimite [message] (ex. „ORG:A:{...}”) partenerului tabelului
+         * [boardId], semnat cu codul de împerechere. Fără partener sau fără
+         * cod valid nu trimite nimic (partenerul l-ar respinge oricum).
+         */
+        fun sendSigned(context: Context, boardId: String, message: String): Boolean {
+            val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val phone = prefs.getString("flutter.sync_partner_phone_$boardId", null)?.trim().orEmpty()
+            val code = prefs.getString(secretKey(boardId), null)
+            if (phone.isEmpty() || !SyncAuth.isValidCode(code)) return false
+            SmsSender.send(context, phone, SyncAuth.sign(code!!, message))
+            return true
+        }
+
         private fun queuePrefs(context: Context): SharedPreferences =
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -133,36 +150,11 @@ class SmsSyncReceiver : BroadcastReceiver() {
         return senderDigits.takeLast(minLen) == partnerDigits.takeLast(minLen)
     }
 
-    // Găsește tabelul al cărui partener configurat corespunde expeditorului.
-    // Întoarce null dacă niciun tabel nu așteaptă mesaje de la acest număr —
-    // altfel oricine ne știe numărul ar putea injecta/modifica/șterge
-    // înregistrări trimițând un SMS "ORG:...".
-    private fun matchingBoardId(flutterPrefs: SharedPreferences, sender: String): String? {
-        val boardsJson = flutterPrefs.getString("flutter.management_boards", null)
-        if (boardsJson == null) {
-            // Migrarea Dart nu a rulat încă — un singur tabel implicit.
-            val partnerDigits = digitsOnly(flutterPrefs.getString("flutter.sync_partner_phone", null))
-            return if (matches(sender, partnerDigits)) "" else null
-        }
-        val boards = JSONArray(boardsJson)
-        for (i in 0 until boards.length()) {
-            val id = boards.getJSONObject(i).optString("id", "")
-            if (id.isEmpty()) continue
-            val partnerDigits = digitsOnly(flutterPrefs.getString("flutter.sync_partner_phone_$id", null))
-            if (matches(sender, partnerDigits)) return id
-        }
-        return null
-    }
-
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
 
         val pdus = Telephony.Sms.Intents.getMessagesFromIntent(intent)
             ?: return
-
-        val flutterPrefs = context.getSharedPreferences(
-            "FlutterSharedPreferences", Context.MODE_PRIVATE
-        )
 
         // Grupăm PDU-urile pe expeditor și concatenăm corpul
         // (SMS multipart: toate segmentele sosesc în același broadcast)
@@ -173,35 +165,68 @@ class SmsSyncReceiver : BroadcastReceiver() {
             bySender.getOrPut(sender) { StringBuilder() }.append(body)
         }
 
-        for ((sender, sb) in bySender) {
-            val body = sb.toString()
-            if (!body.startsWith(SYNC_PREFIX)) continue
-
-            val boardId = matchingBoardId(flutterPrefs, sender) ?: continue
-
-            if (body.startsWith(LICENSE_PREFIX)) {
-                try {
-                    val decision = LicenseStore.adoptFromPartner(
-                        context, body.removePrefix(LICENSE_PREFIX)
-                    )
-                    Log.i("OrgDiag", "license from partner: $decision")
-                } catch (e: Exception) {
-                    Log.e("OrgDiag", "license from partner FAILED", e)
-                }
-                continue
-            }
-            if (body.startsWith(LICENSE_REQUEST_PREFIX)) {
-                LicenseStore.shareableLicense(context)?.let {
-                    sendSms(context, sender, LICENSE_PREFIX + it)
-                }
-                continue
-            }
-
-            enqueue(context, boardId, body, ORIGIN_PARTNER)
-        }
+        for ((sender, sb) in bySender) handleSms(context, sender, sb.toString())
     }
 
-    private fun sendSms(context: Context, phone: String, message: String) {
-        SmsSender.send(context, phone, message)
+    // internal: apelat direct de teste.
+    internal fun handleSms(context: Context, sender: String, rawBody: String) {
+        if (!rawBody.startsWith(SYNC_PREFIX)) return
+
+        // Doar de la partenerul configurat al unui tabel ȘI semnat cu codul de
+        // împerechere al acelui tabel — altfel oricine ne știe numărul (sau
+        // falsifică numărul partenerului) ar putea injecta/modifica/șterge
+        // înregistrări. Același partener poate fi pe mai multe tabele; tabelul
+        // e cel al cărui cod validează semnătura.
+        val flutterPrefs = context.getSharedPreferences(
+            "FlutterSharedPreferences", Context.MODE_PRIVATE
+        )
+        var boardId: String? = null
+        var body: String? = null
+        for (candidate in partnerBoards(flutterPrefs, sender)) {
+            val inner = SyncAuth.verify(flutterPrefs.getString(secretKey(candidate), null), rawBody)
+            if (inner != null) {
+                boardId = candidate
+                body = inner
+                break
+            }
+        }
+        if (boardId == null || body == null) {
+            Log.w("OrgDiag", "sync message rejected: unknown sender or invalid signature")
+            return
+        }
+
+        if (body.startsWith(LICENSE_PREFIX)) {
+            try {
+                val decision = LicenseStore.adoptFromPartner(
+                    context, body.removePrefix(LICENSE_PREFIX)
+                )
+                Log.i("OrgDiag", "license from partner: $decision")
+            } catch (e: Exception) {
+                Log.e("OrgDiag", "license from partner FAILED", e)
+            }
+            return
+        }
+        if (body.startsWith(LICENSE_REQUEST_PREFIX)) {
+            LicenseStore.shareableLicense(context)?.let {
+                sendSigned(context, boardId, LICENSE_PREFIX + it)
+            }
+            return
+        }
+
+        enqueue(context, boardId, body, ORIGIN_PARTNER)
+    }
+
+    // Tabelele al căror partener configurat corespunde expeditorului.
+    private fun partnerBoards(flutterPrefs: SharedPreferences, sender: String): List<String> {
+        val boardsJson = flutterPrefs.getString("flutter.management_boards", null) ?: return emptyList()
+        val boards = try { JSONArray(boardsJson) } catch (_: Exception) { return emptyList() }
+        val result = mutableListOf<String>()
+        for (i in 0 until boards.length()) {
+            val id = boards.optJSONObject(i)?.optString("id", "") ?: continue
+            if (id.isEmpty()) continue
+            val partnerDigits = digitsOnly(flutterPrefs.getString("flutter.sync_partner_phone_$id", null))
+            if (matches(sender, partnerDigits)) result.add(id)
+        }
+        return result
     }
 }

@@ -160,4 +160,12 @@ class BackupFormatTest {
         )
         assertTrue(BackupFormat.autoBackupsToDelete(names, keep = 14).isEmpty())
     }
+
+    @Test
+    fun `codul de imperechere urmeaza regula partenerilor la restore`() {
+        val current = mapOf("flutter.sync_secret_b1" to "CURENT12")
+        val backup = mapOf<String, Any?>("flutter.sync_secret_b1" to "BACKUP12")
+        assertEquals("CURENT12", BackupFormat.mergeForRestore(current, backup, keepSyncPartners = true)["flutter.sync_secret_b1"])
+        assertEquals("BACKUP12", BackupFormat.mergeForRestore(current, backup, keepSyncPartners = false)["flutter.sync_secret_b1"])
+    }
 }

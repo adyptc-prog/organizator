@@ -32,6 +32,9 @@ String _itemsKeyFor(String boardId)         => 'management_items_$boardId';
 String _nextNumberKeyFor(String boardId)    => 'management_next_number_$boardId';
 String _deletedBufferKeyFor(String boardId) => 'management_deleted_buffer_$boardId';
 String _syncPartnerKeyFor(String boardId)   => 'sync_partner_phone_$boardId';
+// Codul de împerechere al tabelului — semnează mesajele de sincronizare
+// (SyncAuth.kt); trebuie introdus identic pe ambele telefoane.
+String _syncSecretKeyFor(String boardId)    => 'sync_secret_$boardId';
 
 // ── Chei pentru setările de rezervări prin SMS (per tabel) ────────────────────
 String _bookingEnabledKeyFor(String boardId)      => 'booking_enabled_$boardId';
@@ -421,43 +424,91 @@ class ValidationService {
 class SyncService {
   static const _ch = MethodChannel('organizator/sms');
   static String? _partnerPhone;
+  static String? _pairingCode;
   static String  _boardId = '';
 
+  static const minCodeLength = 8;
+
   static bool get isSupported => _isAndroid;
+  // Activă doar cu număr ȘI cod de împerechere — fără cod, partenerul ar
+  // respinge toate mesajele (sunt semnate).
   static bool get isActive =>
-      _partnerPhone != null && _partnerPhone!.isNotEmpty;
+      _partnerPhone != null &&
+      _partnerPhone!.isNotEmpty &&
+      isValidCode(_pairingCode);
   static String? get partnerPhone => _partnerPhone;
+  static String? get pairingCode =>
+      _pairingCode == null ? null : formatCode(_pairingCode!);
+
+  // Identic cu SyncAuth.normalizeCode din Kotlin.
+  static String normalizeCode(String? code) =>
+      (code ?? '').toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+
+  static bool isValidCode(String? code) =>
+      normalizeCode(code).length >= minCodeLength;
+
+  // „K7QM2XPA” → „K7QM-2XPA”, ușor de citit și de tastat pe celălalt telefon.
+  static String formatCode(String code) {
+    final n = normalizeCode(code);
+    final groups = <String>[];
+    for (var i = 0; i < n.length; i += 4) {
+      groups.add(n.substring(i, min(i + 4, n.length)));
+    }
+    return groups.join('-');
+  }
+
+  // Fără caractere ușor de confundat (0/O, 1/I/L).
+  static String generateCode() {
+    const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    final r = Random.secure();
+    return formatCode(
+        List.generate(minCodeLength, (_) => alphabet[r.nextInt(alphabet.length)])
+            .join());
+  }
 
   // Fiecare tabel are propriul partener de sincronizare — se încarcă la
   // activarea tabelului respectiv.
   static Future<void> load(String boardId) async {
     _boardId = boardId;
     _partnerPhone = null;
+    _pairingCode = null;
     if (!isSupported) return;
     final prefs = await SharedPreferences.getInstance();
     _partnerPhone = prefs.getString(_syncPartnerKeyFor(boardId));
+    _pairingCode = prefs.getString(_syncSecretKeyFor(boardId));
   }
 
-  static Future<void> setPartner(String phone) async {
+  static Future<void> setPartner(String phone, String code) async {
     _partnerPhone = phone.trim();
+    _pairingCode = normalizeCode(code);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_syncPartnerKeyFor(_boardId), _partnerPhone!);
+    await prefs.setString(_syncSecretKeyFor(_boardId), _pairingCode!);
   }
 
   static Future<void> clearPartner() async {
     _partnerPhone = null;
+    _pairingCode = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_syncPartnerKeyFor(_boardId));
+    await prefs.remove(_syncSecretKeyFor(_boardId));
+  }
+
+  // Semnarea și trimiterea se fac nativ (SmsSyncReceiver.sendSigned).
+  static Future<bool> _sendForBoard(String boardId, String msg) async {
+    if (!isSupported) return false;
+    try {
+      return await _ch.invokeMethod<bool>(
+              'sendSync', {'boardId': boardId, 'message': msg}) ??
+          false;
+    } catch (_) {
+      return false;
+    }
   }
 
   static Future<void> _send(String msg) async {
     if (!isActive || !isSupported) return;
-    try {
-      await _ch.invokeMethod<void>('sendSms', {
-        'phone': _partnerPhone,
-        'message': msg,
-      });
-    } catch (_) {}
+    await _sendForBoard(_boardId, msg);
   }
 
   // Trimite toate înregistrările la sincronizarea inițială
@@ -489,17 +540,21 @@ class SyncService {
     await _send(license != null ? 'ORG:L:$license' : 'ORG:R:');
   }
 
-  // Partenerii tuturor tabelelor (câte unul per tabel), fără duplicate.
-  static Future<List<String>> allPartnerPhones() async {
+  // Tabelele cu partener și cod de împerechere, câte unul per număr de
+  // telefon (același partener pe mai multe tabele primește un singur SMS).
+  static Future<List<String>> pairedBoards() async {
     final prefs = await SharedPreferences.getInstance();
     final boards = await _loadOrMigrateBoards(prefs);
-    final phones = <String, String>{};
+    final byPhone = <String, String>{};
     for (final b in boards) {
       final phone = prefs.getString(_syncPartnerKeyFor(b.id))?.trim() ?? '';
       final digits = phone.replaceAll(RegExp(r'\D'), '');
-      if (digits.isNotEmpty) phones.putIfAbsent(digits, () => phone);
+      if (digits.isEmpty || !isValidCode(prefs.getString(_syncSecretKeyFor(b.id)))) {
+        continue;
+      }
+      byPhone.putIfAbsent(digits, () => b.id);
     }
-    return phones.values.toList();
+    return byPhone.values.toList();
   }
 
   // Trimite licența activă tuturor partenerilor. Întoarce numărul de
@@ -508,16 +563,11 @@ class SyncService {
     if (!isSupported) return 0;
     final license = await LicenseService.getShareableLicense();
     if (license == null) return 0;
-    final phones = await allPartnerPhones();
-    for (final phone in phones) {
-      try {
-        await _ch.invokeMethod<void>('sendSms', {
-          'phone': phone,
-          'message': 'ORG:L:$license',
-        });
-      } catch (_) {}
+    var sent = 0;
+    for (final boardId in await pairedBoards()) {
+      if (await _sendForBoard(boardId, 'ORG:L:$license')) sent++;
     }
-    return phones.length;
+    return sent;
   }
 
   // Fiecare mesaj din coadă e etichetat de partea nativă cu tabelul al cărui
@@ -555,15 +605,8 @@ class SyncService {
 
   // Trimite partenerului unui anumit tabel (nu neapărat cel activ) — pentru
   // schimbările făcute nativ, cu aplicația închisă, pe orice tabel.
-  static Future<void> sendToBoardPartner(String boardId, String msg) async {
-    if (!isSupported) return;
-    final prefs = await SharedPreferences.getInstance();
-    final phone = prefs.getString(_syncPartnerKeyFor(boardId))?.trim() ?? '';
-    if (phone.isEmpty) return;
-    try {
-      await _ch.invokeMethod<void>('sendSms', {'phone': phone, 'message': msg});
-    } catch (_) {}
-  }
+  static Future<void> sendToBoardPartner(String boardId, String msg) =>
+      _sendForBoard(boardId, msg);
 
   // Scoate din coadă doar intrările procesate — nu și pe cele sosite între
   // timp (golirea completă a cozii le pierdea).
@@ -1055,7 +1098,7 @@ class _ManagementPageState extends State<ManagementPage>
   // Negativ = SMS blocat (utilizatorul a văzut deja explicația).
   Future<int> _shareLicenseWithPartners() async {
     // Fără parteneri nu e nimic de trimis — nici motiv să cerem permisiunea.
-    if ((await SyncService.allPartnerPhones()).isEmpty) return 0;
+    if ((await SyncService.pairedBoards()).isEmpty) return 0;
     if (!await _ensureSmsPermission()) return -1;
     return SyncService.sendLicenseToAllPartners();
   }
@@ -2971,6 +3014,8 @@ class _ManagementPageState extends State<ManagementPage>
   Future<void> _showSyncDialog() async {
     final phoneCtrl =
         TextEditingController(text: SyncService.partnerPhone ?? '');
+    final codeCtrl = TextEditingController();
+    String? codeError;
 
     await showDialog<void>(
       context: context,
@@ -3026,6 +3071,12 @@ class _ManagementPageState extends State<ManagementPage>
                       style: TextStyle(
                           fontSize: 12, color: Colors.grey.shade600),
                     ),
+                    const SizedBox(height: 8),
+                    SelectableText(
+                      'Cod de împerechere: ${SyncService.pairingCode ?? ''}',
+                      style: const TextStyle(
+                          fontSize: 12, fontFamily: 'monospace'),
+                    ),
                   ] else ...[
                     TextField(
                       controller: phoneCtrl,
@@ -3035,6 +3086,30 @@ class _ManagementPageState extends State<ManagementPage>
                         hintText: '+40712345678',
                         border: OutlineInputBorder(),
                         prefixIcon: Icon(Icons.phone_outlined),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: codeCtrl,
+                      textCapitalization: TextCapitalization.characters,
+                      decoration: InputDecoration(
+                        labelText: 'Cod de împerechere *',
+                        hintText: 'ex. K7QM-2XPA',
+                        helperText:
+                            'Același cod pe ambele telefoane. Generează-l pe '
+                            'unul și tastează-l pe celălalt.',
+                        helperMaxLines: 2,
+                        errorText: codeError,
+                        border: const OutlineInputBorder(),
+                        prefixIcon: const Icon(Icons.key_outlined),
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.casino_outlined),
+                          tooltip: 'Generează cod',
+                          onPressed: () => setDs(() {
+                            codeCtrl.text = SyncService.generateCode();
+                            codeError = null;
+                          }),
+                        ),
                       ),
                     ),
                     const SizedBox(height: 12),
@@ -3049,8 +3124,8 @@ class _ManagementPageState extends State<ManagementPage>
                         'La prima sincronizare, toate înregistrările de pe acest '
                         'dispozitiv vor fi trimise prin SMS. Ulterior, fiecare '
                         'modificare va fi sincronizată automat.\n\n'
-                        'Configurează sincronizarea și pe celălalt dispozitiv '
-                        'pentru a primi și de acolo.',
+                        'Configurează sincronizarea și pe celălalt dispozitiv, '
+                        'cu același cod — mesajele cu alt cod sunt ignorate.',
                         style: TextStyle(
                             fontSize: 11, color: Colors.blue.shade700),
                       ),
@@ -3084,8 +3159,13 @@ class _ManagementPageState extends State<ManagementPage>
                 onPressed: () async {
                   final phone = phoneCtrl.text.trim();
                   if (phone.isEmpty) return;
+                  if (!SyncService.isValidCode(codeCtrl.text)) {
+                    setDs(() => codeError =
+                        'Minim ${SyncService.minCodeLength} litere/cifre.');
+                    return;
+                  }
                   if (!await _ensureSmsPermission()) return;
-                  await SyncService.setPartner(phone);
+                  await SyncService.setPartner(phone, codeCtrl.text);
                   setDs(() {});
                   if (ctx.mounted) Navigator.pop(ctx);
                   setState(() {});
