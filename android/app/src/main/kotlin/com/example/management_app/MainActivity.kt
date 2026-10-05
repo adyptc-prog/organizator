@@ -36,6 +36,8 @@ class MainActivity : FlutterActivity() {
     private var pendingBackupDestination: String = "phone"
     private var pendingRestoreResult: MethodChannel.Result? = null
     private var pendingRestoreKeepPartners: Boolean = true
+    @Volatile
+    private var lastPickedRestoreUri: android.net.Uri? = null
 
     // ── Lifecycle ────────────────────────────────────────────────────────────────
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
@@ -112,13 +114,35 @@ class MainActivity : FlutterActivity() {
                         val id = call.argument<String>("id")
                             ?: run { result.error("ARG", "missing id", null); return@setMethodCallHandler }
                         val keep = call.argument<Boolean>("keepSyncPartners") ?: true
+                        val password = call.argument<String>("password")
                         runInBackground(result, "BACKUP_RESTORE_FAILED") {
-                            BackupManager.restoreFromDocumentId(this, id, keep); null
+                            BackupManager.restoreFromDocumentId(this, id, keep, password); null
                         }
                     }
                     "pickAndRestoreBackup" -> pickAndRestoreBackup(
                         call.argument<Boolean>("keepSyncPartners") ?: true, result
                     )
+                    // Fișierul ales anterior era criptat: reîncercăm cu parola,
+                    // fără să-l mai cerem din nou utilizatorului.
+                    "retryPickedRestore" -> {
+                        val uri = lastPickedRestoreUri
+                            ?: run { result.error("ARG", "no picked backup", null); return@setMethodCallHandler }
+                        val keep = call.argument<Boolean>("keepSyncPartners") ?: true
+                        val password = call.argument<String>("password")
+                        runInBackground(result, "BACKUP_RESTORE_FAILED") {
+                            BackupManager.restoreFromUri(this, uri, keep, password)
+                            lastPickedRestoreUri = null
+                            null
+                        }
+                    }
+                    "setPassword" -> {
+                        val password = call.argument<String>("password")
+                            ?: run { result.error("ARG", "missing password", null); return@setMethodCallHandler }
+                        runInBackground(result, "BACKUP_PASSWORD_INVALID") {
+                            BackupPassword.set(this, password)
+                            BackupManager.status(this)
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -340,6 +364,8 @@ class MainActivity : FlutterActivity() {
             try {
                 val value = work()
                 runOnUiThread { result.success(value) }
+            } catch (e: BackupManager.PasswordException) {
+                runOnUiThread { result.error(e.code, e.message, null) }
             } catch (e: Exception) {
                 runOnUiThread { result.error(errorCode, e.message ?: e.toString(), null) }
             }
@@ -409,8 +435,11 @@ class MainActivity : FlutterActivity() {
             return
         }
         val keep = pendingRestoreKeepPartners
+        lastPickedRestoreUri = uri
         runInBackground(result, "BACKUP_RESTORE_FAILED") {
-            BackupManager.restoreFromUri(this, uri, keep); null
+            BackupManager.restoreFromUri(this, uri, keep)
+            lastPickedRestoreUri = null
+            null
         }
     }
 

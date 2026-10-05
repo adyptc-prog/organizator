@@ -94,6 +94,7 @@ object BackupManager {
             "lastAutoAt" to p.getLong(KEY_LAST_AUTO_AT, 0L).takeIf { it > 0 },
             "lastAutoError" to p.getString(KEY_LAST_AUTO_ERROR, null),
             "lastManualAt" to p.getLong(KEY_LAST_MANUAL_AT, 0L).takeIf { it > 0 },
+            "hasPassword" to BackupPassword.isSet(context),
         )
     }
 
@@ -103,8 +104,12 @@ object BackupManager {
 
     fun createBackup(context: Context, auto: Boolean): HashMap<String, Any?> {
         val treeUri = requireFolder(context)
+        val password = BackupPassword.get(context)
+            ?: throw IllegalStateException("Setează mai întâi parola de backup.")
         val now = System.currentTimeMillis()
-        val content = snapshot(context, now).toByteArray(Charsets.UTF_8)
+        // Fișierul pleacă pe stick / în Documents — criptat (BackupCrypto).
+        val content = BackupCrypto.encrypt(snapshot(context, now), password, now)
+            .toByteArray(Charsets.UTF_8)
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(now))
         val prefix = if (auto) BackupFormat.AUTO_PREFIX else BackupFormat.MANUAL_PREFIX
         val name = "$prefix$stamp${BackupFormat.EXTENSION}"
@@ -194,26 +199,55 @@ object BackupManager {
         context.contentResolver.openInputStream(uri)?.use { it.reader(Charsets.UTF_8).readText() }
             ?: throw IllegalStateException("Nu s-a putut citi fișierul de backup.")
 
-    fun restoreFromDocumentId(context: Context, documentId: String, keepSyncPartners: Boolean) {
+    fun restoreFromDocumentId(
+        context: Context, documentId: String, keepSyncPartners: Boolean, password: String? = null,
+    ) {
         val treeUri = requireFolder(context)
         val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
-        restoreContent(context, readText(context, uri), keepSyncPartners)
+        restoreContent(context, readText(context, uri), keepSyncPartners, password)
     }
 
-    fun restoreFromUri(context: Context, uri: Uri, keepSyncPartners: Boolean) =
-        restoreContent(context, readText(context, uri), keepSyncPartners)
+    fun restoreFromUri(context: Context, uri: Uri, keepSyncPartners: Boolean, password: String? = null) =
+        restoreContent(context, readText(context, uri), keepSyncPartners, password)
+
+    /** Backup-ul cere parola (PASSWORD_REQUIRED) sau parola dată e greșită (PASSWORD_WRONG). */
+    class PasswordException(val code: String, message: String) : Exception(message)
+
+    const val PASSWORD_REQUIRED = "BACKUP_PASSWORD_REQUIRED"
+    const val PASSWORD_WRONG = "BACKUP_PASSWORD_WRONG"
+
+    /**
+     * Textul backup-ului (v1) — decriptat dacă e nevoie. Încearcă întâi
+     * parola dată, apoi pe cea salvată pe acest telefon. Backup-urile vechi,
+     * necriptate, merg în continuare.
+     */
+    private fun plainBackup(context: Context, content: String, password: String?): String {
+        if (!BackupCrypto.isEncrypted(content)) return content
+        val candidates = listOfNotNull(password, BackupPassword.get(context)).distinct()
+        for (candidate in candidates) {
+            try {
+                return BackupCrypto.decrypt(content, candidate)
+            } catch (_: BackupCrypto.WrongPasswordException) {
+            }
+        }
+        if (password != null) throw PasswordException(PASSWORD_WRONG, "Parola backup-ului este greșită.")
+        throw PasswordException(PASSWORD_REQUIRED, "Backup-ul este criptat — introdu parola lui.")
+    }
 
     /**
      * Înlocuiește datele cu cele din backup. Ordinea contează:
-     * 1. validare completă (aplicație, versiune, checksum) — înainte de orice scriere;
+     * 1. decriptare (dacă e cazul) și validare completă (aplicație, versiune,
+     *    checksum) — înainte de orice scriere;
      * 2. copie de siguranță a stării curente (before_restore.orgbackup, intern);
      * 3. anularea alarmelor stării curente — altfel ar declanșa payload-urile
      *    restaurate la ore greșite (ID-urile se refolosesc);
      * 4. înlocuirea datelor + identitatea de licență;
      * 5. rearmarea alarmelor din datele restaurate (aceeași logică ca la boot).
      */
-    fun restoreContent(context: Context, content: String, keepSyncPartners: Boolean) {
-        val backup = BackupFormat.decode(content)
+    fun restoreContent(
+        context: Context, content: String, keepSyncPartners: Boolean, password: String? = null,
+    ) {
+        val backup = BackupFormat.decode(plainBackup(context, content, password))
 
         File(context.filesDir, SAFETY_FILE).writeText(snapshot(context), Charsets.UTF_8)
 
@@ -246,6 +280,12 @@ object BackupManager {
             .edit().clear().commit()
 
         AlarmRescheduler.rescheduleAll(context)
+
+        // Telefon nou (fără parolă): parola cu care tocmai s-a deschis backup-ul
+        // devine parola lui, ca backup-ul automat să continue.
+        if (password != null && BackupCrypto.isValidPassword(password) && !BackupPassword.isSet(context)) {
+            BackupPassword.set(context, password)
+        }
     }
 
     private fun cancelAlarms(context: Context, keys: Set<String>) {

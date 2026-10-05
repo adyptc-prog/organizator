@@ -111,15 +111,128 @@ class _BackupScreenState extends State<BackupScreen> {
     );
   }
 
-  Future<void> _restore(
-      String source, Future<void> Function(bool keepPartners) restore) async {
+  // Parola de backup nouă (de două ori, ca să nu fie greșită la tastare).
+  Future<void> _setPassword() async {
+    final pw1 = TextEditingController();
+    final pw2 = TextEditingController();
+    String? error;
+    final password = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDs) => AlertDialog(
+          title: Text(_status.hasPassword
+              ? 'Schimbă parola de backup'
+              : 'Setează parola de backup'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Backup-urile sunt criptate cu această parolă. Fără ea nu pot '
+                'fi restaurate pe alt telefon — păstreaz-o într-un loc sigur.',
+                style: TextStyle(fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: pw1,
+                obscureText: true,
+                decoration: const InputDecoration(
+                    labelText: 'Parolă', border: OutlineInputBorder()),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: pw2,
+                obscureText: true,
+                decoration: InputDecoration(
+                    labelText: 'Repetă parola',
+                    errorText: error,
+                    border: const OutlineInputBorder()),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Anulează'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (pw1.text.length < BackupService.minPasswordLength) {
+                  setDs(() => error =
+                      'Minim ${BackupService.minPasswordLength} caractere.');
+                } else if (pw1.text != pw2.text) {
+                  setDs(() => error = 'Parolele nu coincid.');
+                } else {
+                  Navigator.pop(ctx, pw1.text);
+                }
+              },
+              child: const Text('Salvează'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (password == null || !mounted) return;
+    await _run(() async {
+      _status = await BackupService.setPassword(password);
+      _setMessage('Parola de backup a fost salvată.');
+    });
+  }
+
+  // Parola unui backup criptat (alt telefon, sau parolă schimbată între timp).
+  Future<String?> _askBackupPassword({required bool wrong}) {
+    final ctrl = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Parola backup-ului'),
+        content: TextField(
+          controller: ctrl,
+          obscureText: true,
+          autofocus: true,
+          decoration: InputDecoration(
+            labelText: 'Parolă',
+            errorText: wrong ? 'Parolă greșită. Încearcă din nou.' : null,
+            border: const OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Anulează'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text),
+            child: const Text('Deschide'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // [restore] primește parola introdusă (null la prima încercare — se
+  // folosește parola salvată pe telefon).
+  Future<void> _restore(String source,
+      Future<void> Function(bool keepPartners, String? password) restore) async {
     final keepPartners = await _confirmRestore(source);
     if (keepPartners == null || !mounted) return;
     await _run(() async {
       await widget.onBeforeRestore?.call();
       var ok = false;
       try {
-        await restore(keepPartners);
+        String? password;
+        while (true) {
+          try {
+            await restore(keepPartners, password);
+            break;
+          } on BackupPasswordNeeded catch (e) {
+            if (!mounted) throw const BackupCancelled();
+            // Fără indicator de lucru cât timp așteptăm parola.
+            setState(() => _busy = false);
+            password = await _askBackupPassword(wrong: e.wrong);
+            if (password == null) throw const BackupCancelled();
+            if (mounted) setState(() => _busy = true);
+          }
+        }
         ok = true;
       } finally {
         await widget.onRestored?.call(ok);
@@ -159,13 +272,17 @@ class _BackupScreenState extends State<BackupScreen> {
     if (chosen == null || !mounted) return;
     await _restore(
       'backup-ul din ${_formatDate(chosen.modifiedAt)}',
-      (keep) => BackupService.restoreBackup(chosen.id, keepSyncPartners: keep),
+      (keep, password) => BackupService.restoreBackup(chosen.id,
+          keepSyncPartners: keep, password: password),
     );
   }
 
   Future<void> _restoreFromFile() => _restore(
         'fișierul pe care îl vei alege',
-        (keep) => BackupService.pickAndRestoreBackup(keepSyncPartners: keep),
+        (keep, password) => password == null
+            ? BackupService.pickAndRestoreBackup(keepSyncPartners: keep)
+            : BackupService.retryPickedRestore(
+                keepSyncPartners: keep, password: password),
       );
 
   @override
@@ -250,11 +367,30 @@ class _BackupScreenState extends State<BackupScreen> {
                         : null,
               ),
             ),
+          Card(
+            color: s.hasPassword ? null : Colors.orange.shade50,
+            child: ListTile(
+              leading: Icon(
+                s.hasPassword ? Icons.lock_outline : Icons.lock_open,
+                color: s.hasPassword ? _indigo : Colors.orange.shade800,
+              ),
+              title: Text(s.hasPassword
+                  ? 'Backup-urile sunt criptate cu parolă'
+                  : 'Parola de backup nu e setată'),
+              subtitle: Text(s.hasPassword
+                  ? 'Parola se cere la restaurarea pe alt telefon.'
+                  : 'Fără parolă nu se face niciun backup (nici automat).'),
+              trailing: TextButton(
+                onPressed: _busy ? null : _setPassword,
+                child: Text(s.hasPassword ? 'Schimbă' : 'Setează'),
+              ),
+            ),
+          ),
           const SizedBox(height: 16),
           FilledButton.icon(
             icon: const Icon(Icons.backup),
             label: const Text('Creează backup acum'),
-            onPressed: _busy || !folderOk ? null : _create,
+            onPressed: _busy || !folderOk || !s.hasPassword ? null : _create,
           ),
           const SizedBox(height: 8),
           OutlinedButton.icon(
@@ -298,6 +434,8 @@ class _BackupScreenState extends State<BackupScreen> {
                 'Backup-ul conține toate tabelele, setările și codul de '
                 'instalare împreună cu licența — după restaurare pe un telefon '
                 'nou, licența funcționează în continuare.\n\n'
+                'Fișierele sunt criptate (AES-256): fără parolă, datele '
+                'clienților nu pot fi citite de pe stick sau din telefon.\n\n'
                 'Se păstrează ultimele 14 backup-uri automate; cele manuale '
                 'nu se șterg niciodată automat.',
                 style: Theme.of(context).textTheme.bodyMedium,

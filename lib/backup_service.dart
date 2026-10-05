@@ -12,6 +12,9 @@ class BackupStatus {
   final DateTime? lastAutoAt;
   final String? lastAutoError;
   final DateTime? lastManualAt;
+  // Backup-urile sunt criptate cu parola de backup a telefonului — fără ea
+  // nu se poate crea niciun backup.
+  final bool hasPassword;
 
   const BackupStatus({
     this.folderName,
@@ -21,6 +24,7 @@ class BackupStatus {
     this.lastAutoAt,
     this.lastAutoError,
     this.lastManualAt,
+    this.hasPassword = false,
   });
 
   static DateTime? _date(Object? ms) =>
@@ -34,6 +38,7 @@ class BackupStatus {
         lastAutoAt: _date(m?['lastAutoAt']),
         lastAutoError: m?['lastAutoError'] as String?,
         lastManualAt: _date(m?['lastManualAt']),
+        hasPassword: (m?['hasPassword'] as bool?) ?? false,
       );
 }
 
@@ -66,6 +71,12 @@ class BackupCancelled implements Exception {
   const BackupCancelled();
 }
 
+// Backup-ul e criptat: parola lipsește (wrong = false) sau e greșită.
+class BackupPasswordNeeded implements Exception {
+  final bool wrong;
+  const BackupPasswordNeeded({required this.wrong});
+}
+
 // ─── Serviciu backup ──────────────────────────────────────────────────────────
 // Backup-ul (manual + automat zilnic) și restaurarea sunt implementate nativ
 // (BackupManager.kt), ca backup-ul automat să ruleze și cu aplicația închisă.
@@ -81,6 +92,12 @@ class BackupService {
       return await _ch.invokeMethod<T>(method, args);
     } on PlatformException catch (e) {
       if (e.code.endsWith('_CANCELLED')) throw const BackupCancelled();
+      if (e.code == 'BACKUP_PASSWORD_REQUIRED') {
+        throw const BackupPasswordNeeded(wrong: false);
+      }
+      if (e.code == 'BACKUP_PASSWORD_WRONG') {
+        throw const BackupPasswordNeeded(wrong: true);
+      }
       throw Exception(e.message ?? e.code);
     }
   }
@@ -103,9 +120,26 @@ class BackupService {
     return r.whereType<Map<Object?, Object?>>().map(BackupEntry.fromMap).toList();
   }
 
-  static Future<void> restoreBackup(String id, {required bool keepSyncPartners}) =>
-      _call<void>('restoreBackup', {'id': id, 'keepSyncPartners': keepSyncPartners});
+  static const minPasswordLength = 8;
+
+  static Future<BackupStatus> setPassword(String password) async =>
+      BackupStatus.fromMap(await _call<Map<Object?, Object?>>(
+          'setPassword', {'password': password}));
+
+  static Future<void> restoreBackup(String id,
+          {required bool keepSyncPartners, String? password}) =>
+      _call<void>('restoreBackup', {
+        'id': id,
+        'keepSyncPartners': keepSyncPartners,
+        'password': ?password,
+      });
 
   static Future<void> pickAndRestoreBackup({required bool keepSyncPartners}) =>
       _call<void>('pickAndRestoreBackup', {'keepSyncPartners': keepSyncPartners});
+
+  // Același fișier ales la pickAndRestoreBackup, de data asta cu parola.
+  static Future<void> retryPickedRestore(
+          {required bool keepSyncPartners, required String password}) =>
+      _call<void>('retryPickedRestore',
+          {'keepSyncPartners': keepSyncPartners, 'password': password});
 }
