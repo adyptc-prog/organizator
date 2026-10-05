@@ -2771,6 +2771,15 @@ class _ManagementPageState extends State<ManagementPage>
                             'prin SMS, răspunzând cu numărul opțiunii.',
                     style: const TextStyle(fontSize: 13, color: Colors.black54),
                   ),
+                  const SizedBox(height: 6),
+                  // Trebuie să rămână la fel ca BotLimits.kt.
+                  const Text(
+                    'Protecție anti-abuz: botul răspunde doar numerelor de '
+                    'telefon, cel mult 10 mesaje pe oră de la același număr '
+                    'și 100 de răspunsuri pe zi; un client poate avea cel '
+                    'mult 2 rezervări active.',
+                    style: TextStyle(fontSize: 11, color: Colors.black45),
+                  ),
                   const SizedBox(height: 10),
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,

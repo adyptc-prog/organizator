@@ -1,0 +1,136 @@
+package com.example.management_app
+
+import android.content.Context
+import androidx.test.core.app.ApplicationProvider
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
+class ClientBookingReceiverTest {
+
+    private lateinit var context: Context
+    private val receiver = ClientBookingReceiver()
+    private val client = "+40712345678"
+
+    @Before
+    fun setUp() {
+        context = ApplicationProvider.getApplicationContext()
+        context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE).edit()
+            .putString("flutter.management_boards",
+                JSONArray().put(JSONObject().put("id", "b1").put("name", "Salon Ana")).toString())
+            .putBoolean("flutter.booking_enabled_b1", true)
+            .putLong("flutter.appointment_duration_b1", 30L)
+            .putLong("flutter.work_start_b1", 0L)
+            .putLong("flutter.work_end_b1", 24L * 60 - 1)
+            .putString("flutter.management_items_b1", "[]")
+            .commit()
+        SmsSender.testSink = { phone, message -> sent.add(phone to message) }
+    }
+
+    private val sent = mutableListOf<Pair<String, String>>()
+
+    @After
+    fun tearDown() {
+        SmsSender.testSink = null
+    }
+
+    private fun clearSent() = sent.clear()
+
+    // Textul ultimului SMS trimis de bot, sau null dacă n-a trimis nimic.
+    private fun lastSent(): String? = sent.lastOrNull()?.second
+
+    private fun queueFutureBooking(syncId: String, daysAhead: Long) {
+        val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")
+        val end = LocalDateTime.now().plusDays(daysAhead).withHour(12).withMinute(0)
+        val payload = JSONObject().put("s", syncId).put("n", client)
+            .put("c", end.minusMinutes(30).format(fmt)).put("e", end.format(fmt)).put("p1", client)
+        SmsSyncReceiver.enqueue(context, "b1", "ORG:A:$payload")
+    }
+
+    @Test
+    fun `raspunde la LIBER de la un numar de telefon`() {
+        receiver.handleMessage(context, client, "liber")
+        val sent = lastSent()
+        assertNotNull(sent)
+        assertTrue(sent!!.startsWith("Ore libere Salon Ana"))
+    }
+
+    @Test
+    fun `nu raspunde expeditorilor alfanumerici sau numerelor scurte`() {
+        receiver.handleMessage(context, "BancaX", "liber")
+        receiver.handleMessage(context, "1234", "liber")
+        assertNull(lastSent())
+    }
+
+    @Test
+    fun `peste 10 comenzi pe ora botul tace`() {
+        repeat(BotLimits.MAX_COMMANDS_PER_NUMBER_PER_HOUR) {
+            clearSent()
+            receiver.handleMessage(context, client, "liber")
+            assertNotNull(lastSent())
+        }
+        clearSent()
+        receiver.handleMessage(context, client, "liber")
+        assertNull(lastSent())
+    }
+
+    @Test
+    fun `textele obisnuite nu consuma din limita`() {
+        repeat(30) { receiver.handleMessage(context, client, "salut, ce faci?") }
+        receiver.handleMessage(context, client, "liber")
+        assertNotNull(lastSent())
+    }
+
+    @Test
+    fun `cu 2 rezervari active nu se mai ofera ore`() {
+        queueFutureBooking("r1", 1)
+        queueFutureBooking("r2", 2)
+
+        receiver.handleMessage(context, client, "liber")
+        assertTrue(lastSent()!!.startsWith("Ai deja 2 rezervări active"))
+    }
+
+    @Test
+    fun `a doua rezervare activa e permisa, a treia nu`() {
+        queueFutureBooking("r1", 1)
+        receiver.handleMessage(context, client, "liber")
+        assertTrue(lastSent()!!.startsWith("Ore libere"))
+        receiver.handleMessage(context, client, "1")
+        assertTrue(lastSent()!!.startsWith("Programarea ta"))
+
+        receiver.handleMessage(context, client, "liber")
+        assertTrue(lastSent()!!.startsWith("Ai deja 2 rezervări active"))
+    }
+
+    @Test
+    fun `tabelul necunoscut nu dezvaluie numele tabelelor`() {
+        receiver.handleMessage(context, client, "liber xyz")
+        val sent = lastSent()!!
+        assertTrue(sent.startsWith("Nu am găsit tabelul"))
+        assertFalse(sent.contains("Salon Ana"))
+    }
+
+    @Test
+    fun `numaratoarea zilnica e salvata`() {
+        receiver.handleMessage(context, client, "liber")
+        val state = JSONObject(
+            context.getSharedPreferences("ClientBookingPrefs", Context.MODE_PRIVATE)
+                .getString("rateLimits", "{}")!!
+        )
+        assertEquals(1, state.getInt("dayCount"))
+    }
+}

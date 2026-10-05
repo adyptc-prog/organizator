@@ -52,6 +52,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
         private const val OFFERS_KEY        = "offers"
         private const val OFFER_TTL_MIN     = 20L
         private const val CANCEL_OFFERS_KEY = "cancelOffers"
+        private const val RATE_KEY          = "rateLimits"
         private const val CANCEL_OFFER_TTL_MIN = 10L
         // Stare „aștept răspuns cu numărul de nopți” — tabele în modul „zile”,
         // imediat după „liber”. TTL scurt: e un singur pas, nu o navigare.
@@ -119,7 +120,8 @@ class ClientBookingReceiver : BroadcastReceiver() {
         return nfd.replace(Regex("\\p{Mn}+"), "").lowercase().trim()
     }
 
-    private fun handleMessage(context: Context, sender: String, rawBody: String) {
+    // internal: apelat direct de testele Robolectric (fără SMS-uri reale).
+    internal fun handleMessage(context: Context, sender: String, rawBody: String) {
         Log.i("OrgDiag", "handleMessage sender=$sender rawBody=\"$rawBody\"")
         if (rawBody.startsWith("ORG:")) {
             Log.i("OrgDiag", "handleMessage: ignored, looks like sync message (ORG:)")
@@ -129,6 +131,10 @@ class ClientBookingReceiver : BroadcastReceiver() {
         val senderDigits = digitsOnly(sender)
         if (senderDigits.isEmpty()) {
             Log.w("OrgDiag", "handleMessage: senderDigits empty, aborting")
+            return
+        }
+        if (!BotLimits.isReplyableSender(sender)) {
+            Log.i("OrgDiag", "handleMessage: sender is not a phone number, ignoring")
             return
         }
         if (isSyncPartner(context, senderDigits)) {
@@ -144,6 +150,20 @@ class ClientBookingReceiver : BroadcastReceiver() {
         val cancelMatch = CANCEL_RE.find(body)
         val numberMatch = NUMBER_RE.find(body)
         Log.i("OrgDiag", "handleMessage: liberMatch=${liberMatch != null} cancelMatch=${cancelMatch != null} numberMatch=${numberMatch != null}")
+
+        val isCommand = liberMatch != null || body == "next" || cancelMatch != null || numberMatch != null
+        if (!isCommand) {
+            Log.i("OrgDiag", "handleMessage: no pattern matched, ignoring silently (by design)")
+            return
+        }
+        // Fiecare răspuns e un SMS plătit — limităm cât poate cere un număr
+        // și cât răspunde botul pe zi. Peste limită: tăcere (un răspuns de
+        // refuz ar costa la fel).
+        val limit = registerCommand(context, senderDigits)
+        if (limit != BotLimits.Decision.ALLOW) {
+            Log.w("OrgDiag", "handleMessage: rate limited ($limit)")
+            return
+        }
 
         when {
             liberMatch != null -> {
@@ -174,9 +194,32 @@ class ClientBookingReceiver : BroadcastReceiver() {
                     else     -> confirmOffer(context, sender, senderDigits, choice)
                 }
             }
-            else -> Log.i("OrgDiag", "handleMessage: no pattern matched, ignoring silently (by design)")
-            // orice alt text e ignorat complet — reduce riscul de fals-pozitive
         }
+    }
+
+    private fun registerCommand(context: Context, senderDigits: String): BotLimits.Decision {
+        val prefs = bookingPrefs(context)
+        val state = try {
+            JSONObject(prefs.getString(RATE_KEY, "{}") ?: "{}")
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        val today = java.time.LocalDate.now().toString()
+        val decision = BotLimits.register(state, senderDigits, System.currentTimeMillis(), today)
+        prefs.edit().putString(RATE_KEY, state.toString()).apply()
+        return decision
+    }
+
+    // Plafonul de rezervări active pe număr — altfel cineva putea ocupa toate
+    // orele libere cu „liber” + „1” repetat.
+    private fun bookingLimitReached(context: Context, sender: String, senderDigits: String): Boolean {
+        if (BotLimits.canBookMore(findActiveBookings(context, senderDigits).size)) return false
+        sendSms(
+            context, sender,
+            "Ai deja ${BotLimits.MAX_ACTIVE_BOOKINGS_PER_NUMBER} rezervări active. " +
+                "Pentru una nouă, anulează mai întâi una scriind ANULEAZA."
+        )
+        return true
     }
 
     // ── Excludere parteneri de sincronizare (device-to-device) ──────────────────
@@ -332,8 +375,8 @@ class ClientBookingReceiver : BroadcastReceiver() {
 
         val board = matchBoard(boards, token)
         if (board == null) {
-            val names = boards.joinToString(", ") { it.name }
-            sendSms(context, sender, "Nu am găsit tabelul \"$token\". Tabele disponibile: $names.")
+            // Nu trimitem lista tabelelor — numele interne nu sunt pentru oricine.
+            sendSms(context, sender, "Nu am găsit tabelul \"$token\". Verifică numele și scrie din nou LIBER.")
             return
         }
 
@@ -343,6 +386,8 @@ class ClientBookingReceiver : BroadcastReceiver() {
             sendSms(context, sender, "Rezervările prin SMS nu sunt active pentru ${board.name}.")
             return
         }
+
+        if (bookingLimitReached(context, sender, senderDigits)) return
 
         if (settings.mode == BoardMode.ZILE) {
             setNightsOffer(context, senderDigits, board.id)
@@ -515,6 +560,10 @@ class ClientBookingReceiver : BroadcastReceiver() {
             return
         }
         val settings = BookingSettings.loadSettings(context, board.id)
+        if (bookingLimitReached(context, sender, senderDigits)) {
+            clearOffer(context, senderDigits)
+            return
+        }
 
         // Prezența cheii „nights” în ofertă marchează un tabel „zile” — alt
         // algoritm de calcul, alt format de confirmare, dar același mecanism

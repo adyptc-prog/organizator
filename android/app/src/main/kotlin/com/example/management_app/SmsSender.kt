@@ -24,7 +24,13 @@ object SmsSender {
 
     private val requestCodes = AtomicInteger((System.currentTimeMillis() % 1_000_000).toInt())
 
+    // Doar pentru teste: când e setat, mesajele sunt înregistrate aici în
+    // loc să fie trimise.
+    @Volatile
+    internal var testSink: ((phone: String, message: String) -> Unit)? = null
+
     fun send(context: Context, phone: String, message: String) {
+        testSink?.let { it(phone, message); return }
         val app = context.applicationContext
         try {
             val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
