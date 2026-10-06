@@ -569,6 +569,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
     // reprogramează notificările), fără cod Dart suplimentar.
     private fun cancelBooking(context: Context, sender: String, candidate: CancelCandidate) {
         enqueueSyncMessage(context, candidate.boardId, "ORG:D:${candidate.syncId}")
+        BotReminders.cancel(context, candidate.syncId)
         sendSms(context, sender, "Programarea ta ${candidate.label} a fost anulată.")
     }
 
@@ -599,12 +600,15 @@ class ClientBookingReceiver : BroadcastReceiver() {
         // fără ea, rezervarea n-ar avea reminder deloc.
         // Ca în aplicație, intervalul se socotește față de data de expirare (e).
         val warning = end.minusMinutes(BookingSettings.loadAlertLeadMin(context, boardId).toLong())
-        if (warning.isAfter(LocalDateTime.now())) item.put("w", warning.format(ISO_SHORT))
+        val hasWarning = warning.isAfter(LocalDateTime.now())
+        if (hasWarning) item.put("w", warning.format(ISO_SHORT))
         // Rezervare făcută de client prin bot: telefonul e al clientului, nu
         // un destinatar de alerte — fără SMS „EXPIRAT” la final.
         item.put("b", true)
 
         enqueueSyncMessage(context, boardId, "ORG:A:$item")
+        // Reminderul pleacă și dacă aplicația nu e deschisă până atunci.
+        if (hasWarning) BotReminders.schedule(context, syncId, sender, sender, warning, end)
         return syncId
     }
 
