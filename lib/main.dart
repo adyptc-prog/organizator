@@ -2701,7 +2701,7 @@ class _ManagementPageState extends State<ManagementPage>
                     ],
                   ),
                   const SizedBox(height: 8),
-                  const Text('Zile închise',
+                  const Text('Zile în care NU lucrezi (fără programări)',
                       style: TextStyle(
                           fontSize: 13, fontWeight: FontWeight.w600)),
                   const SizedBox(height: 6),
@@ -2712,6 +2712,8 @@ class _ManagementPageState extends State<ManagementPage>
                       return FilterChip(
                         label: Text(e.value),
                         selected: selected,
+                        selectedColor: Colors.red.shade100,
+                        checkmarkColor: Colors.red.shade700,
                         onSelected: (sel) => setDs(() {
                           if (sel) {
                             closedDays.add(e.key);
@@ -2722,6 +2724,24 @@ class _ManagementPageState extends State<ManagementPage>
                       );
                     }).toList(),
                   ),
+                  const SizedBox(height: 6),
+                  Builder(builder: (_) {
+                    final open = dayLabels.entries
+                        .where((e) => !closedDays.contains(e.key))
+                        .map((e) => e.value)
+                        .toList();
+                    return Text(
+                      open.isEmpty
+                          ? '⚠️  Toate zilele sunt bifate — nu se poate face '
+                              'nicio programare.'
+                          : 'Se pot face programări: ${open.join(', ')}',
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: open.isEmpty
+                              ? Colors.orange.shade700
+                              : Colors.grey.shade700),
+                    );
+                  }),
                 ],
               ),
             ),

@@ -67,6 +67,15 @@ class ClientBookingReceiver : BroadcastReceiver() {
         // aceasta programare") — normalize() scoate deja diacriticele, deci
         // "anulează" ajunge tot aici.
         private val CANCEL_RE  = Regex("^(anuleaza|anulare)(\\s+.*)?$")
+        // Cât timp clientul are o listă activă, acceptăm și forme ca „3.”,
+        // „3)”, „nr 3”, „opțiunea 3”, „ora 3” (diacriticele sunt deja scoase).
+        private val LOOSE_NUMBER_RE =
+            Regex("^(?:(?:optiunea|optiune|varianta|numarul|numar|nr|ora)\\.?\\s*)?(\\d{1,2})\\s*[.)!]*$")
+        // Un text scurt, nerecunoscut, primit în timpul unei liste active
+        // primește o singură dată un mesaj de ajutor; unul lung e probabil
+        // un SMS personal și rămâne fără răspuns.
+        private const val HELP_MAX_LEN = 60
+        private val TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
     }
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -142,24 +151,52 @@ class ClientBookingReceiver : BroadcastReceiver() {
 
         val liberMatch  = LIBER_RE.find(body)
         val cancelMatch = CANCEL_RE.find(body)
+        val bookingOffer = getOffer(context, senderDigits)
+        val cancelOffer  = getCancelOffer(context, senderDigits)
+        val hasActiveList = bookingOffer != null || cancelOffer != null
         val numberMatch = NUMBER_RE.find(body)
-        Diag.i("handleMessage: liberMatch=${liberMatch != null} cancelMatch=${cancelMatch != null} numberMatch=${numberMatch != null}")
+            ?: if (hasActiveList) LOOSE_NUMBER_RE.find(body) else null
+        Diag.i("handleMessage: liberMatch=${liberMatch != null} cancelMatch=${cancelMatch != null} numberMatch=${numberMatch != null} activeList=$hasActiveList")
 
         val isCommand = liberMatch != null || body == "next" || cancelMatch != null || numberMatch != null
-        if (!isCommand) {
+        // Lista activă la care se referă ajutorul — cea mai recentă câștigă,
+        // ca la alegerea numerică.
+        val helpFor = if (!isCommand && body.length <= HELP_MAX_LEN) {
+            listOfNotNull(
+                bookingOffer?.takeUnless { it.optBoolean("helped") }?.let { "booking" to it.optLong("ts", 0L) },
+                cancelOffer?.takeUnless { it.optBoolean("helped") }?.let { "cancel" to it.optLong("ts", 0L) },
+            ).maxByOrNull { it.second }?.first
+        } else null
+        if (!isCommand && helpFor == null) {
             Diag.i("handleMessage: no pattern matched, ignoring silently (by design)")
             return
         }
         // Fiecare răspuns e un SMS plătit — limităm cât poate cere un număr
-        // și cât răspunde botul pe zi. Peste limită: tăcere (un răspuns de
-        // refuz ar costa la fel).
+        // și cât răspunde botul pe zi.
         val limit = registerCommand(context, senderDigits)
         if (limit != BotLimits.Decision.ALLOW) {
             Diag.w("handleMessage: rate limited ($limit)")
+            if (limit == BotLimits.Decision.NUMBER_LIMIT) notifyLimit(context, sender, senderDigits)
             return
         }
 
         when {
+            helpFor == "booking" -> {
+                markHelped(context, OFFERS_KEY, senderDigits)
+                sendSms(
+                    context, sender,
+                    "Nu am înțeles. Răspunde doar cu numărul orei dorite (ex. 2), " +
+                        "NEXT pentru alte ore sau LIBER pentru o căutare nouă."
+                )
+            }
+            helpFor == "cancel" -> {
+                markHelped(context, CANCEL_OFFERS_KEY, senderDigits)
+                sendSms(
+                    context, sender,
+                    "Nu am înțeles. Răspunde doar cu numărul programării pe care vrei " +
+                        "să o anulezi (ex. 1)."
+                )
+            }
             liberMatch != null -> {
                 val token = liberMatch.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }
                 startOffer(context, sender, senderDigits, token)
@@ -171,8 +208,6 @@ class ClientBookingReceiver : BroadcastReceiver() {
                 // întrebat ultimul mesaj trimis clientului: ce opțiune de
                 // rezervare alege, sau ce programare alege să anuleze. Când
                 // ambele sunt active, câștigă cea mai recentă interacțiune.
-                val bookingOffer = getOffer(context, senderDigits)
-                val cancelOffer  = getCancelOffer(context, senderDigits)
                 val choice = numberMatch.groupValues[1].toInt()
                 val candidates = listOfNotNull(
                     bookingOffer?.let { "booking" to it.optLong("ts", 0L) },
@@ -184,6 +219,39 @@ class ClientBookingReceiver : BroadcastReceiver() {
                 }
             }
         }
+    }
+
+    // Peste limita pe oră: o singură explicație, cu ora de la care poate
+    // scrie din nou (BotLimits decide dacă se trimite).
+    private fun notifyLimit(context: Context, sender: String, senderDigits: String) {
+        val prefs = bookingPrefs(context)
+        val state = try {
+            JSONObject(prefs.getString(RATE_KEY, "{}") ?: "{}")
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        val untilMs = BotLimits.limitNotice(state, senderDigits, System.currentTimeMillis()) ?: return
+        prefs.edit().putString(RATE_KEY, state.toString()).apply()
+        val until = java.time.Instant.ofEpochMilli(untilMs)
+            .atZone(java.time.ZoneId.systemDefault()).toLocalTime()
+        sendSms(
+            context, sender,
+            "Ai trimis multe mesaje într-un timp scurt. Poți reveni după ora ${until.format(TIME_FMT)}."
+        )
+    }
+
+    // Ajutorul se trimite o singură dată pe listă.
+    private fun markHelped(context: Context, key: String, senderDigits: String) {
+        val prefs = bookingPrefs(context)
+        val all = try {
+            JSONObject(prefs.getString(key, "{}") ?: "{}")
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        val o = all.optJSONObject(senderDigits) ?: return
+        o.put("helped", true)
+        all.put(senderDigits, o)
+        prefs.edit().putString(key, all.toString()).apply()
     }
 
     private fun registerCommand(context: Context, senderDigits: String): BotLimits.Decision {
