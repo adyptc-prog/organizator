@@ -145,6 +145,33 @@ class ClientBookingReceiverTest {
     }
 
     @Test
+    fun `rezervarea facuta de bot primeste alerta cu intervalul ales in aplicatie`() {
+        context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE).edit()
+            .putLong("flutter.alert_lead_minutes_b1", 15L).commit()
+        receiver.handleMessage(context, client, "liber")
+        receiver.handleMessage(context, client, "1")
+        val msg = JSONArray(SmsSyncReceiver.snapshot(context)).getJSONObject(0).getString("msg")
+        val j = JSONObject(msg.removePrefix("ORG:A:"))
+        val fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")
+        val end = LocalDateTime.parse(j.getString("e"), fmt)
+        assertEquals(end.minusMinutes(15).format(fmt), j.getString("w"))
+    }
+
+    @Test
+    fun `fara interval salvat alerta e cu o ora inainte, iar una trecuta lipseste`() {
+        assertEquals(60, BookingSettings.loadAlertLeadMin(context, "b1"))
+        // Durata 30 min, alerta cu 60 min înainte de final: pentru primul slot
+        // liber momentul a trecut deja — nu se trimite o alertă inutilă.
+        receiver.handleMessage(context, client, "liber")
+        receiver.handleMessage(context, client, "1")
+        val msg = JSONArray(SmsSyncReceiver.snapshot(context)).getJSONObject(0).getString("msg")
+        val j = JSONObject(msg.removePrefix("ORG:A:"))
+        val end = LocalDateTime.parse(j.getString("e"), DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm"))
+        if (end.minusMinutes(60).isAfter(LocalDateTime.now())) assertTrue(j.has("w"))
+        else assertFalse(j.has("w"))
+    }
+
+    @Test
     fun `mesajele de sincronizare ale ambelor aplicatii sunt ignorate`() {
         receiver.handleMessage(context, client, "ORG:D:abc")
         receiver.handleMessage(context, client, "PEN:D:abc")

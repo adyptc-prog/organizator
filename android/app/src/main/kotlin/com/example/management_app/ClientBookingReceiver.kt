@@ -595,6 +595,11 @@ class ClientBookingReceiver : BroadcastReceiver() {
         item.put("c", start.format(ISO_SHORT))
         item.put("e", end.format(ISO_SHORT))
         item.put("p1", sender)
+        // Alerta (reminderul SMS către client) cu intervalul ales în aplicație;
+        // fără ea, rezervarea n-ar avea reminder deloc.
+        // Ca în aplicație, intervalul se socotește față de data de expirare (e).
+        val warning = end.minusMinutes(BookingSettings.loadAlertLeadMin(context, boardId).toLong())
+        if (warning.isAfter(LocalDateTime.now())) item.put("w", warning.format(ISO_SHORT))
         // Rezervare făcută de client prin bot: telefonul e al clientului, nu
         // un destinatar de alerte — fără SMS „EXPIRAT” la final.
         item.put("b", true)

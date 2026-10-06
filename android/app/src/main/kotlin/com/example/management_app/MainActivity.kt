@@ -182,6 +182,10 @@ class MainActivity : FlutterActivity() {
                         result.success(computeFreeSlotsJson(boardId, horizonDays, maxResults))
                     }
 
+                    "getAutostartState" -> result.success(BackgroundStart.autostartState(this))
+
+                    "openAutostartSettings" -> result.success(BackgroundStart.openAutostartSettings(this))
+
                     "getSmsFailure" -> result.success(SmsStatus.pendingFailure(this))
 
                     "dismissSmsFailure" -> {
