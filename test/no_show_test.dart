@@ -202,7 +202,8 @@ void main() {
           .where((c) => c.method == 'sendSync')
           .map((c) => (c.arguments as Map)['message'] as String)
           .where((m) => m.startsWith('ORG:F:712345678|'));
-      expect(sent, hasLength(2)); // câte unul pe fiecare tabel
+      // Câte unul pe fiecare tabel (cele 2 din test sunt completate la 10).
+      expect(sent, hasLength(kBoardCount));
     });
 
     testWidgets('lista arată clienții blocați după pragul ales', (tester) async {
