@@ -48,6 +48,8 @@ class ClientBookingReceiver : BroadcastReceiver() {
         private const val CANCEL_OFFERS_KEY = "cancelOffers"
         private const val RATE_KEY          = "rateLimits"
         private const val CANCEL_OFFER_TTL_MIN = 10L
+        private const val BLOCK_NOTICE_KEY  = "noShowBlockNotices"
+        private const val DAY_MS = 24L * 60L * 60L * 1000L
         private const val PAGE_SIZE       = 6
         private const val HORIZON_DAYS    = 14
         private const val MAX_TOTAL_SLOTS = 200
@@ -179,6 +181,15 @@ class ClientBookingReceiver : BroadcastReceiver() {
             if (limit == BotLimits.Decision.NUMBER_LIMIT) notifyLimit(context, sender, senderDigits)
             return
         }
+        // Un număr se referă la lista activă cea mai recentă (rezervare sau anulare).
+        val numberTarget = listOfNotNull(
+            bookingOffer?.let { "booking" to it.optLong("ts", 0L) },
+            cancelOffer?.let  { "cancel"  to it.optLong("ts", 0L) },
+        ).maxByOrNull { it.second }?.first
+        // Clientul blocat pentru neprezentări mai poate doar anula.
+        val cancelRelated = cancelMatch != null || helpFor == "cancel" ||
+            (numberMatch != null && numberTarget == "cancel")
+        if (!cancelRelated && blockedForNoShows(context, sender, senderDigits)) return
 
         when {
             helpFor == "booking" -> {
@@ -209,11 +220,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
                 // rezervare alege, sau ce programare alege să anuleze. Când
                 // ambele sunt active, câștigă cea mai recentă interacțiune.
                 val choice = numberMatch.groupValues[1].toInt()
-                val candidates = listOfNotNull(
-                    bookingOffer?.let { "booking" to it.optLong("ts", 0L) },
-                    cancelOffer?.let  { "cancel"  to it.optLong("ts", 0L) },
-                )
-                when (candidates.maxByOrNull { it.second }?.first) {
+                when (numberTarget) {
                     "cancel" -> confirmCancel(context, sender, senderDigits, choice)
                     else     -> confirmOffer(context, sender, senderDigits, choice)
                 }
@@ -525,8 +532,45 @@ class ClientBookingReceiver : BroadcastReceiver() {
         sendSms(
             context, sender,
             "Programarea ta la ${board.name} pe ${slot.start.format(DISPLAY_TIME_FMT)}-" +
-                "${slot.end.format(DISPLAY_TIME_FMT)}$dateSuffix a fost înregistrată. Te așteptăm!"
+                "${slot.end.format(DISPLAY_TIME_FMT)}$dateSuffix a fost înregistrată. Te așteptăm!" +
+                noShowWarning(context, sender)
         )
+    }
+
+    // ── Neprezentări ─────────────────────────────────────────────────────────────
+    // Clientul care a atins pragul de neprezentări nu mai poate rezerva prin
+    // SMS (poate doar anula). Explicația pleacă cel mult o dată pe zi; restul
+    // cererilor rămân fără răspuns, ca la limita de mesaje.
+    private fun blockedForNoShows(context: Context, sender: String, senderDigits: String): Boolean {
+        val count = NoShowStore.countFor(context, sender)
+        if (!NoShowStore.isBlocked(count, NoShowStore.threshold(context))) return false
+        Diag.i("handleMessage: sender blocked for no-shows (count=$count)")
+        clearOffer(context, senderDigits)
+        val prefs = bookingPrefs(context)
+        val notices = try {
+            JSONObject(prefs.getString(BLOCK_NOTICE_KEY, "{}") ?: "{}")
+        } catch (_: Exception) {
+            JSONObject()
+        }
+        val now = System.currentTimeMillis()
+        if (now - notices.optLong(senderDigits, 0L) < DAY_MS) return true
+        notices.put(senderDigits, now)
+        prefs.edit().putString(BLOCK_NOTICE_KEY, notices.toString()).apply()
+        sendSms(
+            context, sender,
+            "Nu mai poți face programări prin SMS din cauza neprezentărilor repetate. " +
+                "Te rugăm să suni la salon."
+        )
+        return true
+    }
+
+    // La o singură neprezentare de prag, clientul e avertizat la confirmare.
+    private fun noShowWarning(context: Context, sender: String): String {
+        val threshold = NoShowStore.threshold(context)
+        val count = NoShowStore.countFor(context, sender)
+        if (threshold <= 0 || count <= 0 || count != threshold - 1) return ""
+        return "\nAtenție: ai $count ${if (count == 1) "neprezentare" else "neprezentări"}. " +
+            "La $threshold nu mai poți rezerva prin SMS."
     }
 
     // ── Flux „anuleaza” / „anulare” ─────────────────────────────────────────────
