@@ -3018,10 +3018,12 @@ class _ManagementPageState extends State<ManagementPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    'Clienții pot trimite SMS cu "liber" (opțional urmat '
-                    'de numele tabelului, ex. "liber pensat") ca să '
-                    'primească ore disponibile și să rezerve direct '
-                    'prin SMS, răspunzând cu numărul opțiunii.',
+                    'Clienții trimit SMS cu "liber" urmat de numele '
+                    'tabelului (categoria, ex. "liber unghii"), aleg '
+                    'serviciul din lista primită (butonul Servicii), apoi '
+                    'ora liberă — răspunzând de fiecare dată cu numărul '
+                    'opțiunii. Doar "liber" trimite lista categoriilor '
+                    'active.',
                     style: TextStyle(fontSize: 13, color: Colors.black54),
                   ),
                   const SizedBox(height: 6),

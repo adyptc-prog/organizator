@@ -181,7 +181,7 @@ class ClientBookingReceiverTest {
     fun `tabelul necunoscut nu dezvaluie numele tabelelor`() {
         receiver.handleMessage(context, client, "liber xyz")
         val sent = lastSent()!!
-        assertTrue(sent.startsWith("Nu am găsit tabelul"))
+        assertTrue(sent.startsWith("Nu am găsit categoria"))
         assertFalse(sent.contains("Salon Ana"))
     }
 

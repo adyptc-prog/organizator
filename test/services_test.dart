@@ -214,6 +214,37 @@ void main() {
       expect(sentSync(), isEmpty);
     });
 
+    testWidgets('rezervarea botului își păstrează serviciul în tabel',
+        (tester) async {
+      queue.add({
+        'id': '1',
+        'board': 'b1',
+        'msg': 'ORG:A:${jsonEncode({
+          's': 'bot1',
+          'n': '+40712345678',
+          'c': '2030-01-14T09:00',
+          'e': '2030-01-14T10:30',
+          'p1': '+40712345678',
+          'b': true,
+          'v': 'Gel',
+          'm': 90,
+        })}',
+        'origin': 'local',
+      });
+      tester.view.physicalSize = const Size(1200, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(const ManagementApp());
+      await settle(tester);
+
+      final prefs = await SharedPreferences.getInstance();
+      final items = jsonDecode(prefs.getString('management_items_b1')!) as List;
+      final saved = Item.fromJson(items.single as Map<String, dynamic>);
+      expect((saved.service, saved.durationMin), ('Gel', 90));
+      // Trimisă și partenerului, cu serviciul.
+      expect(sentSync().single, contains('"v":"Gel"'));
+    });
+
     testWidgets('la adăugare se alege serviciul tabelului', (tester) async {
       final prefs = await SharedPreferences.getInstance();
       await saveServices(prefs, 'b1', const [
