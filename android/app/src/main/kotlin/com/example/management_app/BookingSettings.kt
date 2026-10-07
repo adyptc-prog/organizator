@@ -26,11 +26,14 @@ data class BookedItem(
     val description: String,
     val phones: List<String>,
     val expiresAt: LocalDateTime?,
+    // Durata serviciului programării; null = durata implicită a tabelului.
+    val durationMin: Int? = null,
+    val service: String? = null,
 )
 
 /**
  * Citește tabelele, setările de rezervare și programările existente direct din
- * SharedPreferences-ul Flutter — folosit atât de MainActivity (afișarea „Spatiere”
+ * SharedPreferences-ul Flutter — folosit atât de MainActivity (rândurile libere din ecranul „Servicii”
  * pe Android) cât și de ClientBookingReceiver (botul SMS), ca să existe o singură
  * sursă de adevăr pentru calculul locurilor libere pe această platformă.
  */
@@ -98,9 +101,13 @@ object BookingSettings {
         }
     }
 
-    // Intervalul ocupat al unei programări = [expiresAt - durată, expiresAt) —
-    // aceeași convenție ca funcția „Spatiere” din Dart (durata e o setare unică
-    // per tabel, nu per înregistrare).
+    // Durata pozitivă salvată pe programare (câmpul „durationMin” / „m”), sau null.
+    private fun durationOf(o: JSONObject, key: String): Int? =
+        (o.opt(key) as? Number)?.toInt()?.takeIf { it > 0 }
+
+    // Intervalul ocupat al unei programări = [expiresAt - durată, expiresAt),
+    // unde durata e a serviciului programării (Item.durationMin din Dart) sau,
+    // pentru programările fără serviciu, [durationMin] — durata implicită.
     fun loadBusyIntervals(context: Context, boardId: String, durationMin: Int): List<BusyInterval> {
         val p = prefs(context)
         val result = mutableListOf<BusyInterval>()
@@ -119,7 +126,8 @@ object BookingSettings {
                     if (expiresStr.isEmpty()) { skippedNoExpiry++; continue }
                     val end = parseFlexibleIso(expiresStr)
                     if (end == null) { skippedBadDate++; Diag.w("loadBusyIntervals: unparsable expiresAt=\"$expiresStr\""); continue }
-                    result.add(BusyInterval(end.minusMinutes(durationMin.toLong()), end))
+                    val d = durationOf(o, "durationMin") ?: durationMin
+                    result.add(BusyInterval(end.minusMinutes(d.toLong()), end))
                 }
                 Diag.i("loadBusyIntervals: totalItems=${arr.length()} busyParsed=${result.size} skippedNoExpiry=$skippedNoExpiry skippedBadDate=$skippedBadDate")
             } catch (e: Exception) {
@@ -135,7 +143,8 @@ object BookingSettings {
             if (prefix !in ITEM_PREFIXES) continue
             val j = parsePayload(payload) ?: continue
             val end = parseFlexibleIso(j.optString("e", "")) ?: continue
-            result.add(BusyInterval(end.minusMinutes(durationMin.toLong()), end))
+            val d = durationOf(j, "m") ?: durationMin
+            result.add(BusyInterval(end.minusMinutes(d.toLong()), end))
         }
 
         return result
@@ -180,6 +189,8 @@ object BookingSettings {
                         description = o.optString("description", ""),
                         phones = phones,
                         expiresAt = expiresAt,
+                        durationMin = durationOf(o, "durationMin"),
+                        service = o.optString("service", "").takeIf { it.isNotEmpty() },
                     )
                 }
             } catch (e: Exception) {
@@ -211,6 +222,8 @@ object BookingSettings {
                 description = j.optString("d", ""),
                 phones = phones,
                 expiresAt = if (expiresStr.isEmpty()) null else parseFlexibleIso(expiresStr),
+                durationMin = durationOf(j, "m"),
+                service = j.optString("v", "").takeIf { it.isNotEmpty() },
             )
         }
 

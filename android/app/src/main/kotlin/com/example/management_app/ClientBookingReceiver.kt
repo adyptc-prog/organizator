@@ -609,7 +609,7 @@ class ClientBookingReceiver : BroadcastReceiver() {
                 val end = item.expiresAt ?: continue
                 if (end.isBefore(now)) continue
                 if (!phoneMatches(item.phones, senderDigits)) continue
-                val start = end.minusMinutes(settings.durationMin.toLong())
+                val start = end.minusMinutes((item.durationMin ?: settings.durationMin).toLong())
                 val dateSuffix = if (start.toLocalDate() != now.toLocalDate())
                     " (${start.format(DISPLAY_DATE_FMT)})" else ""
                 val label = "${board.name} ${start.format(DISPLAY_TIME_FMT)}-${end.format(DISPLAY_TIME_FMT)}$dateSuffix"

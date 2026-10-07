@@ -37,6 +37,46 @@ void main() {
       expect(s, [const SalonService(name: 'Ok', durationMin: 60)]);
     });
 
+    test('programarea își păstrează serviciul și durata (local și în sync)',
+        () {
+      final item = Item(
+        syncId: 'abc',
+        number: 1,
+        name: 'Ana',
+        description: '',
+        createdAt: DateTime(2030, 1, 1, 9),
+        expiresAt: DateTime(2030, 1, 1, 10, 30),
+        service: 'Gel',
+        durationMin: 90,
+      );
+      final local = Item.fromJson(item.toJson());
+      expect((local.service, local.durationMin), ('Gel', 90));
+      final sync = Item.fromSyncJson(item.toSyncJson());
+      expect((sync.service, sync.durationMin), ('Gel', 90));
+      expect(item.toSyncJson()['v'], 'Gel');
+      expect(item.toSyncJson()['m'], 90);
+    });
+
+    test('programarea veche, fără durată, folosește durata tabelului', () {
+      final old = Item.fromJson({
+        'syncId': 'x',
+        'number': 1,
+        'name': 'Ion',
+        'description': '',
+        'createdAt': '2030-01-01T09:00:00.000',
+      });
+      expect(old.service, isNull);
+      expect(old.durationOr(30), 30);
+      expect(old.toSyncJson().containsKey('m'), isFalse);
+      expect(old.copyWith(service: 'Gel', durationMin: 90).durationOr(30), 90);
+      expect(
+          old
+              .copyWith(service: 'Gel', durationMin: 90)
+              .copyWith(clearService: true)
+              .durationMin,
+          isNull);
+    });
+
     test('formatul duratei', () {
       expect(formatServiceDuration(45), '45 min');
       expect(formatServiceDuration(60), '1 oră');
@@ -172,6 +212,34 @@ void main() {
       expect(queue, isEmpty);
       // Mesajul venit de la partener nu se trimite înapoi.
       expect(sentSync(), isEmpty);
+    });
+
+    testWidgets('la adăugare se alege serviciul tabelului', (tester) async {
+      final prefs = await SharedPreferences.getInstance();
+      await saveServices(prefs, 'b1', const [
+        SalonService(name: 'Gel', durationMin: 90),
+        SalonService(name: 'Ojă', durationMin: 30),
+      ]);
+      tester.view.physicalSize = const Size(1200, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(const ManagementApp());
+      await settle(tester);
+
+      await tester.tap(find.byIcon(Icons.add_circle_rounded));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).first, 'Ana');
+      await tester.tap(find.byType(DropdownButtonFormField<SalonService?>));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Gel (1h 30min)').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Adaugă'));
+      await settle(tester);
+
+      final items = jsonDecode(prefs.getString('management_items_b1')!) as List;
+      final saved = Item.fromJson(items.single as Map<String, dynamic>);
+      expect((saved.service, saved.durationMin), ('Gel', 90));
+      expect(find.text('Gel'), findsOneWidget); // coloana Descriere
     });
 
     testWidgets('„Arată orele libere” calculează cu durata serviciului ales',

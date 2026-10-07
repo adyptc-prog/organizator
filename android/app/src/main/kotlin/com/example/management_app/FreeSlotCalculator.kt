@@ -9,7 +9,7 @@ data class FreeSlot(val start: LocalDateTime, val end: LocalDateTime)
 /**
  * Calculează sloturile libere ale unui tabel, ținând cont de programul de lucru,
  * zilele închise și intervalele deja ocupate. Folosită atât pentru afișarea
- * „Spatiere” din aplicație (pe Android, prin MethodChannel) cât și pentru botul
+ * rândurilor libere din aplicație (pe Android, prin MethodChannel) cât și pentru botul
  * SMS de rezervări — o singură implementare pe platforma unde contează.
  *
  * Sloturile se aliniază la începutul programului de lucru (sau la finalul

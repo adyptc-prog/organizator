@@ -432,7 +432,8 @@ class SmsService {
 //
 // Câmpuri JSON compact: s=syncId, n=name, d=description, c=createdAt,
 //   e=expiresAt, w=warningAt, p1/p2/p3=phoneNumbers,
-//   b=rezervare prin bot (viaBot), a=prezență ('c' a venit / 'n' nu a venit)
+//   b=rezervare prin bot (viaBot), a=prezență ('c' a venit / 'n' nu a venit),
+//   v=serviciu, m=durata programării în minute
 class SyncService {
   static const _ch = MethodChannel('organizator/sms');
   static String? _partnerPhone;
@@ -657,6 +658,11 @@ class Item {
   final String? attendance;
   // „Nu a venit” pus automat (neconfirmată în 24h), nu de salon.
   final bool attendanceAuto;
+  // Serviciul programării (din ecranul „Servicii”) și durata lui, în minute.
+  // Programarea ocupă [expiresAt − durationMin, expiresAt]; fără durată
+  // (programări vechi) se folosește durata implicită a tabelului.
+  final String? service;
+  final int? durationMin;
 
   const Item({
     required this.syncId,
@@ -672,7 +678,13 @@ class Item {
     this.viaBot = false,
     this.attendance,
     this.attendanceAuto = false,
+    this.service,
+    this.durationMin,
   });
+
+  /// Durata programării — a ei sau, dacă nu o are, [defaultMin] (tabelul).
+  int durationOr(int defaultMin) =>
+      durationMin != null && durationMin! > 0 ? durationMin! : defaultMin;
 
   // Telefonul după care e recunoscut clientul (neprezentări).
   String? get clientPhone =>
@@ -703,6 +715,9 @@ class Item {
     String? attendance,
     bool clearAttendance = false,
     bool? attendanceAuto,
+    String? service,
+    int? durationMin,
+    bool clearService = false,
   }) {
     return Item(
       syncId:       syncId       ?? this.syncId,
@@ -720,6 +735,8 @@ class Item {
       attendanceAuto: clearAttendance
           ? false
           : (attendanceAuto ?? (attendance != null ? false : this.attendanceAuto)),
+      service:      clearService ? null : (service ?? this.service),
+      durationMin:  clearService ? null : (durationMin ?? this.durationMin),
     );
   }
 
@@ -738,6 +755,8 @@ class Item {
         'viaBot':       viaBot,
         'attendance':   attendance,
         if (attendanceAuto) 'attendanceAuto': true,
+        if (service != null) 'service': service,
+        if (durationMin != null) 'durationMin': durationMin,
       };
 
   factory Item.fromJson(Map<String, dynamic> json) => Item(
@@ -757,6 +776,8 @@ class Item {
         viaBot:       json['viaBot'] as bool? ?? false,
         attendance:   json['attendance'] as String?,
         attendanceAuto: json['attendanceAuto'] == true,
+        service:      json['service'] as String?,
+        durationMin:  json['durationMin'] as int?,
       );
 
   // Format compact pentru SMS (câmpuri opționale omise dacă sunt goale/null)
@@ -773,6 +794,8 @@ class Item {
         if (viaBot) 'b': true,
         if (attendance == kCame) 'a': 'c',
         if (attendance == kNoShow) 'a': 'n',
+        if (service != null) 'v': service,
+        if (durationMin != null) 'm': durationMin,
       };
 
   factory Item.fromSyncJson(Map<String, dynamic> j) => Item(
@@ -788,6 +811,8 @@ class Item {
         phoneNumber3: j['p3'] as String?,
         viaBot:       j['b'] == true,
         attendance:   switch (j['a']) { 'c' => kCame, 'n' => kNoShow, _ => null },
+        service:      j['v'] as String?,
+        durationMin:  j['m'] as int?,
       );
 }
 
@@ -2078,6 +2103,7 @@ class _ManagementPageState extends State<ManagementPage>
       return item.number.toString().contains(q) ||
           item.name.toLowerCase().contains(q) ||
           item.description.toLowerCase().contains(q) ||
+          (item.service?.toLowerCase().contains(q) ?? false) ||
           _formatDateTime(item.createdAt).contains(q) ||
           (item.expiresAt != null && _formatDateTime(item.expiresAt!).contains(q));
     }).toList();
@@ -2127,6 +2153,17 @@ class _ManagementPageState extends State<ManagementPage>
       '${dt.day.toString().padLeft(2, '0')}.'
       '${dt.month.toString().padLeft(2, '0')}.'
       '${dt.year} '
+      '${dt.hour.toString().padLeft(2, '0')}:'
+      '${dt.minute.toString().padLeft(2, '0')}';
+
+  // Coloana „Descriere” arată și serviciul, ca salonul să-l vadă din tabel.
+  String _descriptionWithService(Item item) {
+    final svc = item.service;
+    if (svc == null) return item.description;
+    return item.description.isEmpty ? svc : '$svc · ${item.description}';
+  }
+
+  String _formatTime(DateTime dt) =>
       '${dt.hour.toString().padLeft(2, '0')}:'
       '${dt.minute.toString().padLeft(2, '0')}';
 
@@ -2277,8 +2314,8 @@ class _ManagementPageState extends State<ManagementPage>
     final busy = _items
         .where((i) => i.expiresAt != null)
         .map((i) => (
-              start: i.expiresAt!
-                  .subtract(Duration(minutes: _bookingSettings.durationMin)),
+              start: i.expiresAt!.subtract(Duration(
+                  minutes: i.durationOr(_bookingSettings.durationMin))),
               end: i.expiresAt!,
             ))
         .toList()
@@ -2406,6 +2443,18 @@ class _ManagementPageState extends State<ManagementPage>
     final nameCtrl = TextEditingController(text: existing?.name ?? '');
     final descCtrl = TextEditingController(text: existing?.description ?? '');
     DateTime? selectedExpiry = existing?.expiresAt;
+    // Serviciul programării — dintre cele ale tabelului; unul șters între
+    // timp din listă rămâne selectat la editare.
+    SalonService? selectedService = existing?.service == null
+        ? null
+        : SalonService(
+            name: existing!.service!,
+            durationMin: existing.durationOr(_bookingSettings.durationMin));
+    final serviceOptions = [
+      ..._services,
+      if (selectedService != null && !_services.contains(selectedService))
+        selectedService,
+    ];
 
     final saved = await showDialog<bool>(
       context: context,
@@ -2430,6 +2479,29 @@ class _ManagementPageState extends State<ManagementPage>
                         labelText: 'Descriere', border: OutlineInputBorder()),
                     maxLines: 3,
                   ),
+                  if (serviceOptions.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<SalonService?>(
+                      initialValue: selectedService,
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                          labelText: 'Serviciu', border: OutlineInputBorder()),
+                      items: [
+                        DropdownMenuItem<SalonService?>(
+                          value: null,
+                          child: Text('Fără serviciu (durată implicită '
+                              '${formatServiceDuration(_bookingSettings.durationMin)})'),
+                        ),
+                        for (final svc in serviceOptions)
+                          DropdownMenuItem<SalonService?>(
+                            value: svc,
+                            child: Text('${svc.name} '
+                                '(${formatServiceDuration(svc.durationMin)})'),
+                          ),
+                      ],
+                      onChanged: (v) => setDs(() => selectedService = v),
+                    ),
+                  ],
                   const SizedBox(height: 12),
                   _buildDatePickerRow(
                     label: selectedExpiry == null
@@ -2459,6 +2531,17 @@ class _ManagementPageState extends State<ManagementPage>
                           time.hour, time.minute));
                     },
                   ),
+                  if (selectedExpiry != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 6),
+                      child: Text(
+                        'Ocupă intervalul '
+                        '${_formatTime(selectedExpiry!.subtract(Duration(minutes: selectedService?.durationMin ?? _bookingSettings.durationMin)))}'
+                        '–${_formatTime(selectedExpiry!)}',
+                        style: TextStyle(
+                            fontSize: 12, color: Colors.grey.shade700),
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -2488,6 +2571,9 @@ class _ManagementPageState extends State<ManagementPage>
                             _shiftedWarning(existing, selectedExpiry) == null,
                         // Mutată la altă oră: prezența se confirmă din nou.
                         clearAttendance: selectedExpiry != existing.expiresAt,
+                        service: selectedService?.name,
+                        durationMin: selectedService?.durationMin,
+                        clearService: selectedService == null,
                       );
                     }
                   } else {
@@ -2500,6 +2586,8 @@ class _ManagementPageState extends State<ManagementPage>
                       expiresAt:   selectedExpiry,
                       warningAt:
                           autoWarningFor(selectedExpiry, _alertLeadMin),
+                      service:     selectedService?.name,
+                      durationMin: selectedService?.durationMin,
                     ));
                   }
                 });
@@ -3526,6 +3614,11 @@ class _ManagementPageState extends State<ManagementPage>
               _detailRow('Descriere',
                   item.description.isEmpty ? '—' : item.description),
               const SizedBox(height: 10),
+              if (item.service != null) ...[
+                _detailRow('Serviciu',
+                    '${item.service} (${formatServiceDuration(item.durationOr(_bookingSettings.durationMin))})'),
+                const SizedBox(height: 10),
+              ],
               _detailRow('Creat la', _formatDateTime(item.createdAt)),
               const SizedBox(height: 10),
               _detailRow(
@@ -4073,7 +4166,7 @@ class _ManagementPageState extends State<ManagementPage>
                                                       children: [
                                                         _dataCell(item.number.toString(), width: 70,  expired: expired),
                                                         _nameCell(item, expired),
-                                                        _dataCell(item.description,       width: 200, expired: expired),
+                                                        _dataCell(_descriptionWithService(item), width: 200, expired: expired),
                                                         _dataCell(_formatDateTime(item.createdAt), width: 155, expired: expired),
                                                         _dataCell(
                                                           item.expiresAt != null
@@ -4434,6 +4527,9 @@ class _ManagementPageState extends State<ManagementPage>
         buf.writeln('  Expiră  : ${e.item.expiresAt != null ? _formatDateTime(e.item.expiresAt!) : "nesetată"}');
         if (e.deletedAt != null) {
           buf.writeln('  Șters la: ${_formatDateTime(e.deletedAt!)}');
+        }
+        if (e.item.service != null) {
+          buf.writeln('  Serviciu: ${e.item.service}');
         }
         if (e.item.description.isNotEmpty) {
           buf.writeln('  Descriere: ${e.item.description}');
