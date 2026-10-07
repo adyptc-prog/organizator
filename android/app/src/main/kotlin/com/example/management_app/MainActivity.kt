@@ -179,7 +179,8 @@ class MainActivity : FlutterActivity() {
                             ?: run { result.error("ARG", "missing boardId", null); return@setMethodCallHandler }
                         val horizonDays = call.argument<Int>("horizonDays") ?: 14
                         val maxResults  = call.argument<Int>("maxResults") ?: 200
-                        result.success(computeFreeSlotsJson(boardId, horizonDays, maxResults))
+                        val durationMin = call.argument<Int>("durationMin")
+                        result.success(computeFreeSlotsJson(boardId, durationMin, horizonDays, maxResults))
                     }
 
                     "getAutostartState" -> result.success(BackgroundStart.autostartState(this))
@@ -375,12 +376,14 @@ class MainActivity : FlutterActivity() {
 
     private fun cancelNotifAlarm(id: Int) = AlarmScheduler.cancelNotifAlarm(this, id)
 
-    // ── Calcul sloturi libere (folosit de ecranul „Spatiere” pe Android — aceeași
-    // sursă de adevăr ca botul de rezervări din ClientBookingReceiver) ──────────
-    private fun computeFreeSlotsJson(boardId: String, horizonDays: Int, maxResults: Int): String {
+    // ── Calcul sloturi libere (rândurile libere din tabel, alese din ecranul
+    // „Servicii” — aceeași sursă de adevăr ca botul din ClientBookingReceiver).
+    // [durationMin] = durata serviciului ales; null = durata implicită. ──────
+    private fun computeFreeSlotsJson(boardId: String, durationMin: Int?, horizonDays: Int, maxResults: Int): String {
         return try {
-            val settings = BookingSettings.loadSettings(this, boardId)
-            val busy = BookingSettings.loadBusyIntervals(this, boardId, settings.durationMin)
+            val saved = BookingSettings.loadSettings(this, boardId)
+            val settings = if (durationMin != null && durationMin > 0) saved.copy(durationMin = durationMin) else saved
+            val busy = BookingSettings.loadBusyIntervals(this, boardId, saved.durationMin)
             val slots = FreeSlotCalculator.compute(
                 busy, settings, java.time.LocalDateTime.now(), horizonDays, maxResults
             )

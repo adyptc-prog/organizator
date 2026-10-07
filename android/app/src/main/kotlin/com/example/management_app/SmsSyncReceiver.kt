@@ -219,6 +219,14 @@ class SmsSyncReceiver : BroadcastReceiver() {
             return
         }
 
+        if (body.startsWith(ServicesStore.SYNC_PREFIX)) {
+            // Botul trebuie să ofere imediat serviciile noi, nu abia după
+            // ce aplicația e deschisă și coada procesată.
+            val ok = ServicesStore.applySync(context, boardId, body.removePrefix(ServicesStore.SYNC_PREFIX))
+            Diag.i("services from partner: applied=$ok")
+            if (!ok) return
+        }
+
         enqueue(context, boardId, body, ORIGIN_PARTNER)
     }
 

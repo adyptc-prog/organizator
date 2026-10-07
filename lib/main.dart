@@ -16,6 +16,7 @@ import 'backup_service.dart';
 import 'license_screen.dart';
 import 'license_service.dart';
 import 'no_show.dart';
+import 'services.dart';
 
 // ─── Constante ───────────────────────────────────────────────────────────────
 const _kBoardsKey      = 'management_boards';
@@ -389,13 +390,15 @@ class SmsService {
   // platforme (nu există acces SMS acolo, deci nici bot de rezervat).
   static Future<List<_FreeSlot>> _computeFreeSlots(
     String boardId, {
+    required int durationMin,
     int horizonDays = 14,
     int maxResults = 200,
   }) async {
-    if (!Platform.isAndroid) return [];
+    if (!_isAndroid) return [];
     try {
       final raw = await _ch.invokeMethod<String>('computeFreeSlots', {
             'boardId': boardId,
+            'durationMin': durationMin,
             'horizonDays': horizonDays,
             'maxResults': maxResults,
           }) ??
@@ -424,6 +427,8 @@ class SmsService {
 //   ORG:D:{syncId} — item șters
 //   ORG:I:{json}  — item din sincronizare inițială (bulk)
 //   ORG:Z:        — sfârșitul sincronizării inițiale
+//   ORG:V:{json}  — lista de servicii a tabelului (services.dart); aplicată
+//                   și nativ, la primire, ca botul s-o folosească imediat
 //
 // Câmpuri JSON compact: s=syncId, n=name, d=description, c=createdAt,
 //   e=expiresAt, w=warningAt, p1/p2/p3=phoneNumbers,
@@ -527,6 +532,10 @@ class SyncService {
     }
     await _send('ORG:Z:');
   }
+
+  // Lista de servicii a tabelului (înlocuiește lista partenerului).
+  static Future<void> sendServices(int defaultMin, List<SalonService> services) =>
+      _send(servicesSyncMessage(defaultMin, services));
 
   static Future<void> sendAdd(Item item) =>
       _send('ORG:A:${jsonEncode(item.toSyncJson())}');
@@ -1023,6 +1032,8 @@ class _ManagementPageState extends State<ManagementPage>
   Duration? _spatiereInterval;
   List<_FreeSlot> _cachedFreeSlots = [];
   BookingSettingsData _bookingSettings = BookingSettingsData.defaults;
+  // Serviciile tabelului activ (ecranul „Servicii”, botul SMS).
+  List<SalonService> _services = const [];
   String _searchQuery  = '';
   bool   _loading      = true;
   int    _nextNumber   = 1;
@@ -1371,6 +1382,7 @@ class _ManagementPageState extends State<ManagementPage>
       nextNumber    = prefs.getInt(_nextNumberKeyFor(_activeBoardId)) ?? 1;
       _smsTemplate  = prefs.getString(_kSmsTemplateKey) ?? _kDefaultSmsTemplate;
       _bookingSettings = await _loadBookingSettings(prefs, _activeBoardId);
+      _services = loadServices(prefs, _activeBoardId);
       _alertLeadMin = _loadAlertLead(prefs, _activeBoardId);
       final since = prefs.getString(_kAttendanceSinceKey);
       if (since == null) {
@@ -1670,6 +1682,13 @@ class _ManagementPageState extends State<ManagementPage>
       final byBoard = <String, List<String>>{};
       for (final e in entries) {
         if (e.msg.isEmpty) continue;
+        // Lista de servicii a unui tabel — înlocuiește lista locală.
+        final services = parseServicesSyncMessage(e.msg);
+        if (services != null) {
+          await _applyServicesSync(
+              e.boardId.isEmpty ? 'b1' : e.boardId, services);
+          continue;
+        }
         // Iertarea unui client — comună tuturor tabelelor.
         final forgive = parseForgiveMessage(e.msg);
         if (forgive != null) {
@@ -1699,6 +1718,24 @@ class _ManagementPageState extends State<ManagementPage>
       await SyncService.ackMessages([for (final e in entries) e.id]);
     } finally {
       _syncQueueBusy = false;
+    }
+  }
+
+  // Serviciile primite de la partener (SmsSyncReceiver le-a scris deja nativ,
+  // pentru bot — aici se actualizează și cache-ul Dart și ecranul).
+  Future<void> _applyServicesSync(String boardId, ServicesSync sync) async {
+    if (!_boards.any((b) => b.id == boardId)) return;
+    final prefs = await SharedPreferences.getInstance();
+    await saveServices(prefs, boardId, sync.services);
+    final settings = await _loadBookingSettings(prefs, boardId);
+    final updated = settings.copyWith(durationMin: sync.defaultMin);
+    await _saveBookingSettings(boardId, updated);
+    if (boardId == _activeBoardId && mounted) {
+      setState(() {
+        _services = sync.services;
+        _bookingSettings = updated;
+      });
+      unawaited(_recomputeFreeSlots());
     }
   }
 
@@ -2120,163 +2157,66 @@ class _ManagementPageState extends State<ManagementPage>
     });
   }
 
-  // ── Spatiere (rânduri libere între programări, doar vizual) ─────────────────
-  Future<void> _toggleSpatiere() async {
-    if (_spatiereActiva) {
+  // ── Servicii (lista tabelului + rânduri libere între programări) ─────────────
+  Future<void> _openServices() async {
+    final board = _boards.firstWhere((b) => b.id == _activeBoardId,
+        orElse: () => _boards.first);
+    final result = await Navigator.of(context).push<ServicesResult>(
+      MaterialPageRoute(
+        builder: (_) => ServicesScreen(
+          boardName: board.name,
+          defaultMin: _bookingSettings.durationMin,
+          services: _services,
+          freeSlotsActive: _spatiereActiva,
+        ),
+      ),
+    );
+    if (result == null || !mounted) return;
+
+    if (result.changed) {
+      final prefs = await SharedPreferences.getInstance();
+      await saveServices(prefs, _activeBoardId, result.services);
+      final updated =
+          _bookingSettings.copyWith(durationMin: result.defaultMin);
+      await _saveBookingSettings(_activeBoardId, updated);
       setState(() {
-        _spatiereActiva = false;
-        _cachedFreeSlots = [];
-        if (_sortCriteriaBeforeSpacing != null) {
-          _sortCriteria
-            ..clear()
-            ..addAll(_sortCriteriaBeforeSpacing!);
-          _sortCriteriaBeforeSpacing = null;
-        }
+        _services = result.services;
+        _bookingSettings = updated;
       });
-      return;
+      // Un singur SMS la ieșirea din ecran, nu câte unul la fiecare editare.
+      await SyncService.sendServices(result.defaultMin, result.services);
     }
 
-    final interval = await _showSpatiereDialog();
-    if (interval == null) return;
-
-    setState(() {
-      _spatiereInterval = interval;
-      _spatiereActiva = true;
-      _sortCriteriaBeforeSpacing = List.of(_sortCriteria);
-      _sortCriteria
-        ..clear()
-        ..add((column: SortColumn.expiresAt, ascending: true));
-    });
-
-    // Durata devine setarea persistentă a tabelului — folosită și de botul de
-    // rezervări prin SMS, ca să nu existe două valori diferite pentru „cât
-    // durează o programare”.
-    if (interval.inMinutes != _bookingSettings.durationMin) {
-      final updated = _bookingSettings.copyWith(durationMin: interval.inMinutes);
-      setState(() => _bookingSettings = updated);
-      await _saveBookingSettings(_activeBoardId, updated);
+    final freeDuration = result.freeSlotsDuration;
+    if (freeDuration == 0) {
+      _hideFreeSlots();
+    } else if (freeDuration != null) {
+      setState(() {
+        _spatiereInterval = Duration(minutes: freeDuration);
+        if (!_spatiereActiva) {
+          _sortCriteriaBeforeSpacing = List.of(_sortCriteria);
+          _sortCriteria
+            ..clear()
+            ..add((column: SortColumn.expiresAt, ascending: true));
+        }
+        _spatiereActiva = true;
+      });
     }
     await _recomputeFreeSlots();
   }
 
-  Future<Duration?> _showSpatiereDialog() async {
-    Duration selected = _spatiereInterval ??
-        Duration(minutes: _bookingSettings.durationMin);
-    const presets = [
-      Duration(minutes: 15),
-      Duration(minutes: 30),
-      Duration(hours: 1),
-      Duration(hours: 2),
-    ];
-    bool custom = !presets.contains(selected);
-    final hoursCtrl = TextEditingController(
-        text: selected.inHours.toString());
-    final minutesCtrl = TextEditingController(
-        text: (selected.inMinutes % 60).toString());
-
-    return showDialog<Duration>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setDs) {
-          String label(Duration d) {
-            if (d.inMinutes < 60) return '${d.inMinutes} min';
-            final h = d.inMinutes ~/ 60;
-            final m = d.inMinutes % 60;
-            return m == 0 ? '$h ${h == 1 ? "oră" : "ore"}' : '${h}h ${m}min';
-          }
-
-          Widget presetChip(Duration d) => ChoiceChip(
-                label: Text(label(d)),
-                selected: !custom && selected == d,
-                onSelected: (_) => setDs(() {
-                  selected = d;
-                  custom = false;
-                }),
-              );
-
-          return AlertDialog(
-            title: const Text('Spatiere'),
-            content: SizedBox(
-              width: 360,
-              child: SingleChildScrollView(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Alege intervalul dintre programări. Tabelul va afișa '
-                      'rândurile libere dintre programările existente '
-                      '(sortate după ora de expirare).',
-                      style: TextStyle(fontSize: 13, color: Colors.black54),
-                    ),
-                    const SizedBox(height: 14),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        ...presets.map(presetChip),
-                        ChoiceChip(
-                          label: const Text('Personalizat'),
-                          selected: custom,
-                          onSelected: (_) => setDs(() => custom = true),
-                        ),
-                      ],
-                    ),
-                    if (custom) ...[
-                      const SizedBox(height: 14),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: hoursCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: const InputDecoration(
-                                labelText: 'Ore',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: TextField(
-                              controller: minutesCtrl,
-                              keyboardType: TextInputType.number,
-                              decoration: const InputDecoration(
-                                labelText: 'Minute',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Anulează'),
-              ),
-              FilledButton(
-                onPressed: () {
-                  var result = selected;
-                  if (custom) {
-                    final h = int.tryParse(hoursCtrl.text.trim()) ?? 0;
-                    final m = int.tryParse(minutesCtrl.text.trim()) ?? 0;
-                    result = Duration(hours: h, minutes: m);
-                  }
-                  if (result <= Duration.zero) return;
-                  Navigator.pop(ctx, result);
-                },
-                child: const Text('Aplică'),
-              ),
-            ],
-          );
-        },
-      ),
-    );
+  void _hideFreeSlots() {
+    if (!_spatiereActiva) return;
+    setState(() {
+      _spatiereActiva = false;
+      _cachedFreeSlots = [];
+      if (_sortCriteriaBeforeSpacing != null) {
+        _sortCriteria
+          ..clear()
+          ..addAll(_sortCriteriaBeforeSpacing!);
+        _sortCriteriaBeforeSpacing = null;
+      }
+    });
   }
 
   // Intercalează sloturile libere deja calculate (_cachedFreeSlots, sortate
@@ -2314,8 +2254,10 @@ class _ManagementPageState extends State<ManagementPage>
       if (_cachedFreeSlots.isNotEmpty) setState(() => _cachedFreeSlots = []);
       return;
     }
-    final slots = Platform.isAndroid
-        ? await SmsService._computeFreeSlots(_activeBoardId)
+    final slots = _isAndroid
+        ? await SmsService._computeFreeSlots(_activeBoardId,
+            durationMin: (_spatiereInterval?.inMinutes ??
+                _bookingSettings.durationMin))
         : _computeFreeSlotsLocal();
     debugPrint('OrgDiag: _recomputeFreeSlots activeBoardId=$_activeBoardId '
         'interval=$_spatiereInterval durationMin=${_bookingSettings.durationMin} '
@@ -2334,7 +2276,11 @@ class _ManagementPageState extends State<ManagementPage>
 
     final busy = _items
         .where((i) => i.expiresAt != null)
-        .map((i) => (start: i.expiresAt!.subtract(interval), end: i.expiresAt!))
+        .map((i) => (
+              start: i.expiresAt!
+                  .subtract(Duration(minutes: _bookingSettings.durationMin)),
+              end: i.expiresAt!,
+            ))
         .toList()
       ..sort((a, b) => a.start.compareTo(b.start));
 
@@ -3340,6 +3286,10 @@ class _ManagementPageState extends State<ManagementPage>
       ),
     );
     await SyncService.sendLicenseHandshake();
+    // Doar o listă completată — una goală ar șterge serviciile partenerului.
+    if (_services.isNotEmpty) {
+      await SyncService.sendServices(_bookingSettings.durationMin, _services);
+    }
     await SyncService.sendInitialSync(_items);
     if (!mounted) return;
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -4310,9 +4260,9 @@ class _ManagementPageState extends State<ManagementPage>
               ),
               const SizedBox(width: 10),
               _bottomBtn(
-                icon: Icons.unfold_more_rounded,
-                label: 'Spatiere',
-                onTap: _toggleSpatiere,
+                icon: Icons.design_services_outlined,
+                label: 'Servicii',
+                onTap: _openServices,
                 primary: _spatiereActiva,
               ),
             ],

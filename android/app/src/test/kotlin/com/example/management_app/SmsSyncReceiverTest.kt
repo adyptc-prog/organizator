@@ -96,4 +96,33 @@ class SmsSyncReceiverTest {
         assertFalse(SmsSyncReceiver.sendSigned(context, "b1", msg))
         assertTrue(sent.isEmpty())
     }
+
+    @Test
+    fun `serviciile primite de la partener se scriu imediat pentru bot`() {
+        val v = """ORG:V:{"d":45,"s":[{"n":"Gel","m":90},{"n":"Ojă","m":30}]}"""
+        receiver.handleSms(context, partner, SyncAuth.sign(codeB2, v))
+        assertEquals(
+            listOf(ServiceInfo("Gel", 90), ServiceInfo("Ojă", 30)),
+            ServicesStore.load(context, "b2"),
+        )
+        assertEquals(45, BookingSettings.loadSettings(context, "b2").durationMin)
+        assertTrue(ServicesStore.load(context, "b1").isEmpty())
+        // Și ajunge în coadă, pentru cache-ul din Flutter.
+        assertEquals(v, queue().single().getString("msg"))
+    }
+
+    @Test
+    fun `lista de servicii invalida e ignorata`() {
+        receiver.handleSms(context, partner, SyncAuth.sign(codeB1, """ORG:V:{"d":0}"""))
+        receiver.handleSms(context, partner, SyncAuth.sign(codeB1, "ORG:V:nu-e-json"))
+        assertTrue(ServicesStore.load(context, "b1").isEmpty())
+        assertTrue(queue().isEmpty())
+    }
+
+    @Test
+    fun `serviciile cu durata invalida sunt sarite`() {
+        val v = """ORG:V:{"d":30,"s":[{"n":"","m":30},{"n":"Prea lung","m":9999},{"n":"Ok","m":60}]}"""
+        receiver.handleSms(context, partner, SyncAuth.sign(codeB1, v))
+        assertEquals(listOf(ServiceInfo("Ok", 60)), ServicesStore.load(context, "b1"))
+    }
 }
